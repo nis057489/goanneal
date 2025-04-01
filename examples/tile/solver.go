@@ -5,11 +5,33 @@ import (
 )
 
 type TileState struct {
-	Grid *Grid
+	Grid    *Grid
+	Polygon *Polygon
 }
 
 func (s *TileState) Energy() float64 {
 	cost := 0.0
+	polyTiles := s.Polygon.GetWorldTiles()
+
+	// Check polygon bounds
+	for _, t := range polyTiles {
+		if t.X < 0 || t.X >= s.Grid.Width || t.Y < 0 || t.Y >= s.Grid.Height {
+			return 1000000.0
+		}
+	}
+
+	// Check overlaps
+	for _, t1 := range polyTiles {
+		for _, t2 := range s.Grid.Tiles {
+			if t1.X == t2.X && t1.Y == t2.Y {
+				if t2.Constrained {
+					return 1000000.0
+				}
+				cost += 100.0
+			}
+		}
+	}
+
 	for i, t1 := range s.Grid.Tiles {
 		for j, t2 := range s.Grid.Tiles {
 			if i == j {
@@ -31,16 +53,16 @@ func (s *TileState) Energy() float64 {
 }
 
 func (s *TileState) Move() {
-	// Keep trying until we find an unconstrained tile
-	for {
-		idx := rand.Intn(len(s.Grid.Tiles))
-		tile := s.Grid.Tiles[idx]
-
-		if !tile.Constrained {
-			tile.X = rand.Intn(s.Grid.Width)
-			tile.Y = rand.Intn(s.Grid.Height)
-			return
+	if rand.Float64() < 0.8 {
+		// Try moving polygon with smaller steps
+		dx := rand.Intn(2)*2 - 1 // -1 or 1
+		dy := 0
+		if rand.Float64() < 0.5 {
+			dx, dy = dy, dx // 50% chance to move vertically instead
 		}
+		s.Polygon.Move(dx, dy)
+	} else {
+		s.Polygon.Rotate()
 	}
 }
 
@@ -110,7 +132,33 @@ func (s *TileState) Copy() interface{} {
 		newGrid.Tiles[i] = newTile
 	}
 
-	return &TileState{Grid: newGrid}
+	// Copy polygon
+	newPoly := &Polygon{
+		Width:    s.Polygon.Width,
+		Height:   s.Polygon.Height,
+		Rotation: s.Polygon.Rotation,
+		PosX:     s.Polygon.PosX,
+		PosY:     s.Polygon.PosY,
+		Tiles:    make([][]*Tile, len(s.Polygon.Tiles)),
+	}
+
+	for y := range s.Polygon.Tiles {
+		newPoly.Tiles[y] = make([]*Tile, len(s.Polygon.Tiles[y]))
+		for x := range s.Polygon.Tiles[y] {
+			t := s.Polygon.Tiles[y][x]
+			newPoly.Tiles[y][x] = &Tile{
+				X:           t.X,
+				Y:           t.Y,
+				Color:       t.Color,
+				Constrained: t.Constrained,
+			}
+		}
+	}
+
+	return &TileState{
+		Grid:    newGrid,
+		Polygon: newPoly,
+	}
 }
 
 // Helper functions

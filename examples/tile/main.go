@@ -104,6 +104,16 @@ func (g *Game) Update() error {
 }
 
 func (g *Game) Draw(screen *ebiten.Image) {
+	// Draw polygon first so displaced tiles appear on top
+	if !g.state.Done {
+		polyColor := color.RGBA{128, 0, 128, 128} // Make polygon semi-transparent
+		for _, t := range g.state.Polygon.GetWorldTiles() {
+			x := float64(t.X * g.tileSize)
+			y := float64(t.Y * g.tileSize)
+			ebitenutil.DrawRect(screen, x, y, float64(g.tileSize-1), float64(g.tileSize-1), polyColor)
+		}
+	}
+
 	// Draw tiles with rotation indicators
 	for _, t := range g.state.Grid.Tiles {
 		x := float64(t.X * g.tileSize)
@@ -115,8 +125,27 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		op.GeoM.Rotate(t.Rotation * math.Pi / 180)
 		op.GeoM.Translate(x+float64(g.tileSize)/2, y+float64(g.tileSize)/2)
 
-		// Draw base tile
+		// Draw base tile with highlight for displaced tiles
 		tileColor := getTileColor(t.Color)
+		// if t.Displaced {
+		// 	// Make displaced tiles brighter/highlighted
+		// 	if c, ok := tileColor.(color.RGBA); ok {
+		// 		// Add yellow highlight to displaced tiles
+		// 		tileColor = color.RGBA{
+		// 			R: c.R,
+		// 			G: c.G,
+		// 			B: c.B,
+		// 			A: 255,
+		// 		}
+		// 		// Draw highlight border
+		// 		highlightImg := ebiten.NewImage(g.tileSize+1, g.tileSize+1)
+		// 		highlightImg.Fill(color.RGBA{255, 255, 0, 128})
+		// 		highlightOp := &ebiten.DrawImageOptions{}
+		// 		highlightOp.GeoM = op.GeoM
+		// 		screen.DrawImage(highlightImg, highlightOp)
+		// 	}
+		// }
+
 		tileImg := ebiten.NewImage(g.tileSize-1, g.tileSize-1)
 		tileImg.Fill(tileColor)
 		screen.DrawImage(tileImg, op)
@@ -129,16 +158,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		screen.DrawImage(tickImg, tickOp)
 	}
 
-	// Draw polygon last so it's on top
-	if !g.state.Done {
-		polyColor := color.RGBA{128, 0, 128, 255}
-		for _, t := range g.state.Polygon.GetWorldTiles() {
-			x := float64(t.X * g.tileSize)
-			y := float64(t.Y * g.tileSize)
-			ebitenutil.DrawRect(screen, x, y, float64(g.tileSize-1), float64(g.tileSize-1), polyColor)
-		}
-	}
-
+	// Draw debug text
 	if g.state.Done {
 		msg := "No valid positions found!"
 		if g.state.bestPosition != nil {
@@ -200,7 +220,7 @@ func main() {
 	}
 
 	// Add random unconstrained tiles, avoiding constrained positions
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 350; i++ {
 		x := rand.Intn(20)
 		y := rand.Intn(20)
 		if !constrained[fmt.Sprintf("%d,%d", x, y)] {
@@ -245,14 +265,14 @@ func main() {
 
 	game := &Game{
 		state:          state,
-		temp:           25.0,
-		minTemp:        20.0,    // control minimum temperature here
-		coolRate:       0.999, // slower cooling for visual feedback
+		temp:           25.0,  // starting temperature
+		minTemp:        22.0,  // control how long simulation runs
+		coolRate:       0.999, // very important, try different values. values closer to 1 make the sim run longer
 		tileSize:       30,
 		bestCost:       math.MaxFloat64,
-		repairCounter:  0,
+		repairCounter:  0, // starts at 0. the repair func steps in every 1K iterations to ensure hard constrainst are not violated
 		bestState:      state.Copy().(*TileState),
-		movesPerUpdate: 10, // Perform 10 moves per visual update
+		movesPerUpdate: 10,
 	}
 
 	ebiten.SetWindowSize(600, 600)

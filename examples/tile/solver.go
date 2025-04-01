@@ -3,6 +3,7 @@ package main
 import (
 	"container/heap"
 	"fmt"
+	"math"
 	"math/rand"
 )
 
@@ -45,39 +46,46 @@ func (s *TileState) Energy() float64 {
 	polyTiles := s.Polygon.GetWorldTiles()
 
 	// Check polygon bounds
-	for _, t := range polyTiles {
-		if t.X < 0 || t.X >= s.Grid.Width || t.Y < 0 || t.Y >= s.Grid.Height {
+	for _, pt := range polyTiles {
+		if pt.X < 0 || pt.X >= s.Grid.Width || pt.Y < 0 || pt.Y >= s.Grid.Height {
 			return 1000000.0
 		}
 	}
 
-	// Process tile displacement chain
+	// Count tiles that need to be moved
 	displacementChain := make(map[*Tile]bool)
-	for _, t1 := range polyTiles {
-		for _, t2 := range s.Grid.Tiles {
-			if t1.X == t2.X && t1.Y == t2.Y {
-				if t2.Constrained {
+	for _, pt := range polyTiles {
+		for _, t := range s.Grid.Tiles {
+			if t.X == pt.X && t.Y == pt.Y {
+				if t.Constrained {
 					return 1000000.0 // Invalid position
 				}
 
-				// Calculate rotation angle between 1-45 degrees
-				rotation := float64(1 + (len(displacementChain) % 45))
+				// Base cost per displaced tile (1000)
+				cost += 1000.0
 
-				// Try to displace the tile
-				startX, startY := t2.X, t2.Y
-				if !s.tryDisplaceWithChain(t2, displacementChain, rotation) {
+				// Calculate displacement distance from original position
+				if !s.tryDisplaceWithChain(t, displacementChain, 0) {
+					// Restore all displaced tiles on failure
+					for dt := range displacementChain {
+						dt.X = dt.OrigX
+						dt.Y = dt.OrigY
+						dt.Rotation = 0
+						dt.Displaced = false
+					}
 					return 1000000.0 // Cannot displace
 				}
 
-				// Add displacement cost
-				dx := float64(t2.X - startX)
-				dy := float64(t2.Y - startY)
-				dist := dx*dx + dy*dy
-				cost += dist*100.0 + t2.Rotation*10.0
+				// Add displacement distance cost
+				dx := float64(t.X - t.OrigX)
+				dy := float64(t.Y - t.OrigY)
+				dist := math.Sqrt(dx*dx + dy*dy)
+				cost += dist * 100.0
 			}
 		}
 	}
 
+	// Don't reset positions - they stay displaced unless move is rejected
 	return cost
 }
 
@@ -92,13 +100,48 @@ func (s *TileState) tryDisplaceWithChain(tile *Tile, chain map[*Tile]bool, rotat
 	}
 	chain[tile] = true
 
-	// Try displacement in spiral pattern
-	dx := []int{0, 1, 0, -1, 1, 1, -1, -1}
-	dy := []int{1, 0, -1, 0, 1, -1, 1, -1}
+	// Calculate direction away from polygon center
+	polygonCenterX := float64(s.Polygon.PosX) + float64(s.Polygon.Width)/2
+	polygonCenterY := float64(s.Polygon.PosY) + float64(s.Polygon.Height)/2
+	tileX := float64(tile.X)
+	tileY := float64(tile.Y)
 
-	for i := 0; i < len(dx); i++ {
-		newX := tile.X + dx[i]
-		newY := tile.Y + dy[i]
+	// Get displacement direction vector
+	dx := tileX - polygonCenterX
+	dy := tileY - polygonCenterY
+
+	// Normalize the direction
+	length := math.Sqrt(dx*dx + dy*dy)
+	if length < 0.001 {
+		// If tile is at center, pick random direction
+		angle := rand.Float64() * 2 * math.Pi
+		dx = math.Cos(angle)
+		dy = math.Sin(angle)
+	} else {
+		dx /= length
+		dy /= length
+	}
+
+	// Try positions in order of preference based on direction
+	moves := make([][2]int, 0, 8)
+
+	// Primary direction
+	moves = append(moves, [2]int{int(math.Round(dx)), int(math.Round(dy))})
+
+	// Secondary directions (perpendicular)
+	moves = append(moves, [2]int{int(math.Round(-dy)), int(math.Round(dx))})
+	moves = append(moves, [2]int{int(math.Round(dy)), int(math.Round(-dx))})
+
+	// Add diagonal and remaining directions
+	dirs := [][2]int{{1, 1}, {1, -1}, {-1, 1}, {-1, -1}, {0, 1}, {1, 0}, {0, -1}, {-1, 0}}
+	for _, d := range dirs {
+		moves = append(moves, d)
+	}
+
+	// Try each move direction
+	for _, move := range moves {
+		newX := tile.X + move[0]
+		newY := tile.Y + move[1]
 
 		if newX < 0 || newX >= s.Grid.Width || newY < 0 || newY >= s.Grid.Height {
 			continue
@@ -314,8 +357,12 @@ func (s *TileState) Copy() interface{} {
 		newTile := &Tile{
 			X:           t.X,
 			Y:           t.Y,
+			OrigX:       t.OrigX,
+			OrigY:       t.OrigY,
 			Color:       t.Color,
 			Constrained: t.Constrained,
+			Rotation:    t.Rotation,
+			Displaced:   t.Displaced,
 		}
 		newGrid.Tiles[i] = newTile
 	}

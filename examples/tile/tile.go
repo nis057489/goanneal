@@ -12,11 +12,12 @@ const (
 )
 
 type Tile struct {
-	X, Y        int
-	Color       Color
-	Constrained bool
-	Rotation    float64 // Rotation in degrees for displaced tiles
-	Displaced   bool    // Track if tile has been pushed
+	X, Y         int
+	OrigX, OrigY int // Add these fields
+	Color        Color
+	Constrained  bool
+	Rotation     float64 // Rotation in degrees for displaced tiles
+	Displaced    bool    // Track if tile has been pushed
 }
 
 type Polygon struct {
@@ -38,6 +39,8 @@ func NewRectangle(width, height int, color Color) *Polygon {
 			tiles[y][x] = &Tile{
 				X:           x,
 				Y:           y,
+				OrigX:       x, // Store original position
+				OrigY:       y,
 				Color:       color,
 				Constrained: false,
 				Rotation:    0,
@@ -101,6 +104,8 @@ func (p *Polygon) GetWorldTiles() []*Tile {
 					tile := &Tile{
 						X:           worldX,
 						Y:           worldY,
+						OrigX:       p.Tiles[origY][origX].OrigX,
+						OrigY:       p.Tiles[origY][origX].OrigY,
 						Color:       p.Tiles[origY][origX].Color,
 						Constrained: false,
 						Rotation:    p.Tiles[origY][origX].Rotation,
@@ -178,6 +183,8 @@ func (g *Grid) AddTile(x, y int, color Color, constrained bool) {
 	tile := &Tile{
 		X:           x,
 		Y:           y,
+		OrigX:       x, // Store original position
+		OrigY:       y,
 		Color:       color,
 		Constrained: constrained,
 		Rotation:    0,

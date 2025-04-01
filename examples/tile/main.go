@@ -209,7 +209,7 @@ func main() {
 	}
 
 	// Create a larger polygon to place and ensure valid starting position
-	polygon := NewRectangle(5, 4, Blue)
+	polygon := NewRectangle(4, 4, Blue)
 	polygon.PosX = 4
 	polygon.PosY = 4
 

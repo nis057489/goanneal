@@ -13,39 +13,64 @@ import (
 )
 
 type Game struct {
-	state     *TileState
-	temp      float64
-	coolRate  float64
-	tileSize  int
-	steps     int
-	accepts   int
-	improves  int
-	bestCost  float64
-	lastPrint float64
+	state         *TileState
+	temp          float64
+	coolRate      float64
+	tileSize      int
+	steps         int
+	accepts       int
+	improves      int
+	bestCost      float64
+	lastPrint     float64
+	repairCounter int
+	bestState     *TileState // Add best state tracking
 }
 
 func (g *Game) Update() error {
 	if g.temp > 0.1 { // minimum temperature
 		g.steps++
+		g.repairCounter++
 		currentEnergy := g.state.Energy()
 
 		if g.steps == 1 {
 			g.bestCost = currentEnergy
+			g.bestState = g.state.Copy().(*TileState)
 			fmt.Printf("\nStep\tTemp\t\tEnergy\t\tAccepts\tImproves\tBest\n")
 		}
 
+		// Store previous state before any changes
+		prevState := g.state.Copy().(*TileState)
+
+		// Handle repairs
+		if g.repairCounter >= 1000 {
+			g.repairCounter = 0
+			g.state.RepairConstraints()
+			newEnergy := g.state.Energy()
+
+			// Always accept repair results, but track if it's the best
+			if newEnergy < g.bestCost {
+				g.bestCost = newEnergy
+				g.bestState = g.state.Copy().(*TileState)
+			}
+			return nil
+		}
+
+		// Regular annealing move
 		g.state.Move()
 		newEnergy := g.state.Energy()
 		delta := newEnergy - currentEnergy
 
-		if delta <= 0 {
+		if newEnergy > 1000000 { // Hard constraint violation
+			g.state = prevState
+		} else if delta <= 0 {
 			g.accepts++
 			if newEnergy < g.bestCost {
 				g.improves++
 				g.bestCost = newEnergy
+				g.bestState = g.state.Copy().(*TileState)
 			}
 		} else if math.Exp(-delta/g.temp) < rand.Float64() {
-			g.state = g.state.Copy().(*TileState)
+			g.state = prevState
 		} else {
 			g.accepts++
 		}
@@ -118,11 +143,13 @@ func main() {
 	state := &TileState{Grid: grid}
 
 	game := &Game{
-		state:    state,
-		temp:     25.0,
-		coolRate: 0.999, // slower cooling for visual feedback
-		tileSize: 30,
-		bestCost: math.MaxFloat64,
+		state:         state,
+		temp:          25.0,
+		coolRate:      0.999, // slower cooling for visual feedback
+		tileSize:      30,
+		bestCost:      math.MaxFloat64,
+		repairCounter: 0,
+		bestState:     state.Copy().(*TileState),
 	}
 
 	ebiten.SetWindowSize(600, 600)

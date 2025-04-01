@@ -29,7 +29,16 @@ type Game struct {
 }
 
 func (g *Game) Update() error {
-	if g.temp > 0.1 && !g.state.Done {
+	if g.state.Done {
+		if g.steps > 0 {
+			// Print results once
+			g.state.PrintBestPositions(3)
+			g.steps = 0
+		}
+		return nil
+	}
+
+	if g.temp > 0.1 {
 		// Do multiple moves per update
 		for i := 0; i < g.movesPerUpdate; i++ {
 			g.steps++
@@ -87,10 +96,8 @@ func (g *Game) Update() error {
 		}
 
 		g.temp *= g.coolRate
-	} else if g.state.Done && g.steps > 0 {
-		// Print best positions once when done
-		g.state.PrintBestPositions(3)
-		g.steps = 0 // Prevent printing again
+	} else {
+		g.state.Done = true
 	}
 	return nil
 }
@@ -127,9 +134,10 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	}
 
 	if g.state.Done {
-		msg := "No valid configuration found!"
-		if g.state.Energy() == 0 {
-			msg = "Solution found!"
+		msg := "No valid positions found!"
+		if g.state.bestPosition != nil {
+			msg = fmt.Sprintf("Best position found! Tiles to move: %.0f",
+				g.state.bestPosition.Energy/1000.0)
 		}
 		ebitenutil.DebugPrint(screen, msg)
 	}

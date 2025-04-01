@@ -33,6 +33,7 @@ type TileState struct {
 	Polygon        *Polygon
 	Done           bool
 	validPositions ValidPositionQueue
+	bestPosition   *ValidPosition
 }
 
 func (s *TileState) Energy() float64 {
@@ -99,6 +100,19 @@ func (s *TileState) isValidPosition() bool {
 
 func (s *TileState) Move() {
 	if s.Done {
+		if s.bestPosition == nil && len(s.validPositions) > 0 {
+			// Find best position when simulation ends
+			tmp := make(ValidPositionQueue, len(s.validPositions))
+			copy(tmp, s.validPositions)
+			heap.Init(&tmp)
+			s.bestPosition = heap.Pop(&tmp).(*ValidPosition)
+
+			// Move to best position
+			s.Polygon.PosX = s.bestPosition.X
+			s.Polygon.PosY = s.bestPosition.Y
+			s.Polygon.Rotation = s.bestPosition.Rotation
+			s.Polygon.isDirty = true
+		}
 		return
 	}
 
@@ -299,11 +313,19 @@ func (s *TileState) Copy() interface{} {
 		Polygon:        newPoly,
 		Done:           s.Done,
 		validPositions: newValidPositions,
+		bestPosition:   s.bestPosition,
 	}
 }
 
 func (s *TileState) PrintBestPositions(n int) {
-	fmt.Printf("\nTop %d best positions found:\n", n)
+	if len(s.validPositions) == 0 {
+		fmt.Printf("\nNo valid positions found!\n")
+		return
+	}
+
+	fmt.Printf("\nSimulation complete! Found %d valid positions.\n", len(s.validPositions))
+	fmt.Printf("Top %d best positions:\n", n)
+
 	// Create a temp copy to preserve the original queue
 	tmp := make(ValidPositionQueue, len(s.validPositions))
 	copy(tmp, s.validPositions)
@@ -311,8 +333,8 @@ func (s *TileState) PrintBestPositions(n int) {
 
 	for i := 0; i < n && tmp.Len() > 0; i++ {
 		pos := heap.Pop(&tmp).(*ValidPosition)
-		fmt.Printf("%d. Position: (%d,%d) Rotation: %d° Energy: %.2f\n",
-			i+1, pos.X, pos.Y, pos.Rotation, pos.Energy)
+		fmt.Printf("%d. Position: (%d,%d) Rotation: %d° Energy: %.2f (tiles to move: %.0f)\n",
+			i+1, pos.X, pos.Y, pos.Rotation, pos.Energy, pos.Energy/1000.0)
 	}
 }
 

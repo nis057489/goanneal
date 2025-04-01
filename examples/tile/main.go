@@ -170,11 +170,8 @@ func (g *Game) Layout(w, h int) (int, int) {
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
-	grid := &Grid{
-		Width:  20,
-		Height: 20,
-		Tiles:  make([]*Tile, 0),
-	}
+	// Use NewGrid to properly initialize the grid and spatial index
+	grid := NewGrid(20, 20)
 
 	// Create a set to track constrained positions
 	constrained := make(map[string]bool)

@@ -142,28 +142,49 @@ func (p *Polygon) HasValidMovesLeft(grid *Grid) bool {
 }
 
 type Grid struct {
-	Width  int
-	Height int
-	Tiles  []*Tile
+	Width   int
+	Height  int
+	Tiles   []*Tile
+	spatial *SpatialIndex
 }
 
 func NewGrid(width, height int) *Grid {
-	return &Grid{
+	if width <= 0 || height <= 0 {
+		panic(fmt.Sprintf("Invalid grid dimensions: %dx%d", width, height))
+	}
+
+	grid := &Grid{
 		Width:  width,
 		Height: height,
 		Tiles:  make([]*Tile, 0),
 	}
+
+	grid.spatial = NewSpatialIndex(width, height)
+	if grid.spatial == nil {
+		panic(fmt.Sprintf("Failed to create spatial index for dimensions %dx%d", width, height))
+	}
+
+	return grid
 }
 
 func (g *Grid) AddTile(x, y int, color Color, constrained bool) {
-	g.Tiles = append(g.Tiles, &Tile{
+	if g == nil {
+		panic("Grid is nil")
+	}
+	if g.spatial == nil {
+		panic(fmt.Sprintf("Spatial index not initialized for grid %dx%d", g.Width, g.Height))
+	}
+
+	tile := &Tile{
 		X:           x,
 		Y:           y,
 		Color:       color,
 		Constrained: constrained,
 		Rotation:    0,
 		Displaced:   false,
-	})
+	}
+	g.Tiles = append(g.Tiles, tile)
+	g.spatial.Insert(tile)
 }
 
 func (g *Grid) DisplaceTile(t *Tile, dx, dy int, rotation float64) bool {
@@ -171,34 +192,31 @@ func (g *Grid) DisplaceTile(t *Tile, dx, dy int, rotation float64) bool {
 		return false
 	}
 
-	// Try to find nearby empty space within 2 tile radius
-	for r := 1; r <= 2; r++ {
-		for nx := t.X - r; nx <= t.X+r; nx++ {
-			for ny := t.Y - r; ny <= t.Y+r; ny++ {
-				if nx < 0 || nx >= g.Width || ny < 0 || ny >= g.Height {
-					continue
-				}
+	oldX, oldY := t.X, t.Y
+	newX := oldX + dx
+	newY := oldY + dy
 
-				// Check if position is empty and not overlapping with constrained tiles
-				occupied := false
-				for _, other := range g.Tiles {
-					if other.X == nx && other.Y == ny {
-						occupied = true
-						break
-					}
-				}
+	if newX < 0 || newX >= g.Width || newY < 0 || newY >= g.Height {
+		return false
+	}
 
-				if !occupied {
-					t.X = nx
-					t.Y = ny
-					t.Rotation = rotation
-					t.Displaced = true
-					return true
-				}
-			}
+	// Check for collisions using spatial index
+	collisionRect := &Rect{newX - 1, newY - 1, 3, 3} // Check 1 tile radius
+	nearbyTiles := g.spatial.QueryRect(collisionRect)
+
+	for _, other := range nearbyTiles {
+		if other != t && other.X == newX && other.Y == newY {
+			return false
 		}
 	}
-	return false
+
+	// Update position
+	g.spatial.Update(t, oldX, oldY)
+	t.X = newX
+	t.Y = newY
+	t.Rotation = rotation
+	t.Displaced = true
+	return true
 }
 
 func (g *Grid) GetDisplacedTiles() []*Tile {
@@ -212,10 +230,9 @@ func (g *Grid) GetDisplacedTiles() []*Tile {
 }
 
 func (g *Grid) GetTileAt(x, y int) *Tile {
-	for _, t := range g.Tiles {
-		if t.X == x && t.Y == y {
-			return t
-		}
+	tiles := g.spatial.QueryPoint(x, y)
+	if len(tiles) > 0 {
+		return tiles[0]
 	}
 	return nil
 }

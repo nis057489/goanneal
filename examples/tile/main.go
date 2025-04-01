@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/heap"
 	"fmt"
 	"image/color"
 	"log"
@@ -28,7 +29,7 @@ type Game struct {
 }
 
 func (g *Game) Update() error {
-	if g.temp > 0.1 {
+	if g.temp > 0.1 && !g.state.Done {
 		// Do multiple moves per update
 		for i := 0; i < g.movesPerUpdate; i++ {
 			g.steps++
@@ -86,6 +87,10 @@ func (g *Game) Update() error {
 		}
 
 		g.temp *= g.coolRate
+	} else if g.state.Done && g.steps > 0 {
+		// Print best positions once when done
+		g.state.PrintBestPositions(3)
+		g.steps = 0 // Prevent printing again
 	}
 	return nil
 }
@@ -120,6 +125,14 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			ebitenutil.DrawRect(screen, x, y, float64(g.tileSize-1), float64(g.tileSize-1), polyColor)
 		}
 	}
+
+	if g.state.Done {
+		msg := "No valid configuration found!"
+		if g.state.Energy() == 0 {
+			msg = "Solution found!"
+		}
+		ebitenutil.DebugPrint(screen, msg)
+	}
 }
 
 func (g *Game) Layout(w, h int) (int, int) {
@@ -135,28 +148,73 @@ func main() {
 		Tiles:  make([]*Tile, 0),
 	}
 
-	// Add some constrained tiles (red)
-	grid.AddTile(5, 5, Red, true)
-	grid.AddTile(15, 15, Red, true)
-	grid.AddTile(5, 15, Red, true)
-	grid.AddTile(15, 5, Red, true)
+	// Create a set to track constrained positions
+	constrained := make(map[string]bool)
 
-	// Add random unconstrained tiles
-	for i := 0; i < 100; i++ {
-		x := rand.Intn(20)
-		y := rand.Intn(20)
-		color := Color(rand.Intn(4))
-		grid.AddTile(x, y, color, false)
+	// Add constrained tiles first
+	for x := 3; x < 17; x += 5 {
+		for y := 3; y < 17; y += 5 {
+			grid.AddTile(x, y, Red, true)
+			constrained[fmt.Sprintf("%d,%d", x, y)] = true
+		}
 	}
 
-	// Create polygon to place (e.g., 3x2 rectangle)
-	polygon := NewRectangle(3, 2, Blue)
-	polygon.PosX = 10
-	polygon.PosY = 10
+	// Add border constraints
+	for x := 0; x < 20; x += 5 {
+		grid.AddTile(x, 0, Red, true)
+		grid.AddTile(x, 19, Red, true)
+		constrained[fmt.Sprintf("%d,%d", x, 0)] = true
+		constrained[fmt.Sprintf("%d,%d", x, 19)] = true
+	}
+	for y := 0; y < 20; y += 5 {
+		grid.AddTile(0, y, Red, true)
+		grid.AddTile(19, y, Red, true)
+		constrained[fmt.Sprintf("%d,%d", 0, y)] = true
+		constrained[fmt.Sprintf("%d,%d", 19, y)] = true
+	}
+
+	// Add random unconstrained tiles, avoiding constrained positions
+	for i := 0; i < 150; i++ {
+		x := rand.Intn(20)
+		y := rand.Intn(20)
+		if !constrained[fmt.Sprintf("%d,%d", x, y)] {
+			color := Color(1 + rand.Intn(3)) // Avoid red
+			grid.AddTile(x, y, color, false)
+		}
+	}
+
+	// Create a larger polygon to place and ensure valid starting position
+	polygon := NewRectangle(5, 4, Blue)
+	polygon.PosX = 4
+	polygon.PosY = 4
 
 	state := &TileState{
-		Grid:    grid,
-		Polygon: polygon,
+		Grid:           grid,
+		Polygon:        polygon,
+		validPositions: make(ValidPositionQueue, 0),
+	}
+	heap.Init(&state.validPositions)
+
+	// Validate initial position
+	if !state.isValidPosition() {
+		// Try to find a valid starting position
+		found := false
+		for x := 0; x < grid.Width-4; x++ {
+			for y := 0; y < grid.Height-4; y++ {
+				polygon.PosX = x
+				polygon.PosY = y
+				if state.isValidPosition() {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			log.Fatal("Could not find valid starting position for polygon")
+		}
 	}
 
 	game := &Game{

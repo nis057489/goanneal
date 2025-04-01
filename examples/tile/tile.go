@@ -1,5 +1,7 @@
 package main
 
+import "fmt"
+
 type Color int
 
 const (
@@ -16,13 +18,14 @@ type Tile struct {
 }
 
 type Polygon struct {
-	Tiles       [][]*Tile // 2D grid of tiles representing the polygon
-	Width       int
-	Height      int
-	Rotation    int // 0, 90, 180, 270 degrees
-	PosX, PosY  int // Position of top-left corner
-	cachedTiles []*Tile
-	isDirty     bool
+	Tiles        [][]*Tile // 2D grid of tiles representing the polygon
+	Width        int
+	Height       int
+	Rotation     int // 0, 90, 180, 270 degrees
+	PosX, PosY   int // Position of top-left corner
+	cachedTiles  []*Tile
+	isDirty      bool
+	triedConfigs map[string]bool
 }
 
 func NewRectangle(width, height int, color Color) *Polygon {
@@ -38,11 +41,13 @@ func NewRectangle(width, height int, color Color) *Polygon {
 			}
 		}
 	}
+
 	return &Polygon{
-		Tiles:   tiles,
-		Width:   width,
-		Height:  height,
-		isDirty: true,
+		Tiles:        tiles,
+		Width:        width,
+		Height:       height,
+		isDirty:      true,
+		triedConfigs: make(map[string]bool),
 	}
 }
 
@@ -55,14 +60,14 @@ func (p *Polygon) Move(dx, dy int) {
 	newX := p.PosX + dx
 	newY := p.PosY + dy
 
-	// Check if any part of the polygon would go off screen
+	// Get effective dimensions based on rotation
 	w, h := p.Width, p.Height
 	if p.Rotation == 90 || p.Rotation == 270 {
 		w, h = h, w
 	}
 
-	// Enforce bounds
-	if newX >= 0 && (newX+w) <= 20 && newY >= 0 && (newY+h) <= 20 {
+	// Strict bounds checking
+	if newX >= 0 && newX+w <= 20 && newY >= 0 && newY+h <= 20 {
 		p.PosX = newX
 		p.PosY = newY
 		p.isDirty = true
@@ -117,6 +122,17 @@ func (p *Polygon) transformToWorld(x, y int) (int, int) {
 		return p.PosX + (p.Height - 1 - y), p.PosY + x
 	}
 	return x + p.PosX, y + p.PosY
+}
+
+func (p *Polygon) GetConfigKey() string {
+	return fmt.Sprintf("%d,%d,%d", p.PosX, p.PosY, p.Rotation)
+}
+
+func (p *Polygon) HasValidMovesLeft(grid *Grid) bool {
+	if len(p.triedConfigs) >= 20*20*4 { // all positions * 4 rotations
+		return false
+	}
+	return true
 }
 
 type Grid struct {

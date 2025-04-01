@@ -103,29 +103,34 @@ func (g *Game) Update() error {
 }
 
 func (g *Game) Draw(screen *ebiten.Image) {
-	colors := []color.RGBA{
-		{255, 0, 0, 255},   // Red
-		{0, 0, 255, 255},   // Blue
-		{0, 255, 0, 255},   // Green
-		{255, 255, 0, 255}, // Yellow
-	}
-
-	// Draw existing tiles
+	// Draw tiles with rotation indicators
 	for _, t := range g.state.Grid.Tiles {
 		x := float64(t.X * g.tileSize)
 		y := float64(t.Y * g.tileSize)
 
-		c := colors[t.Color]
-		if t.Constrained {
-			c = colors[0] // Red for constrained tiles
-		}
+		// Create rotation matrix
+		op := &ebiten.DrawImageOptions{}
+		op.GeoM.Translate(-float64(g.tileSize)/2, -float64(g.tileSize)/2)
+		op.GeoM.Rotate(t.Rotation * math.Pi / 180)
+		op.GeoM.Translate(x+float64(g.tileSize)/2, y+float64(g.tileSize)/2)
 
-		ebitenutil.DrawRect(screen, x, y, float64(g.tileSize-1), float64(g.tileSize-1), c)
+		// Draw base tile
+		tileColor := getTileColor(t.Color)
+		tileImg := ebiten.NewImage(g.tileSize-1, g.tileSize-1)
+		tileImg.Fill(tileColor)
+		screen.DrawImage(tileImg, op)
+
+		// Draw rotation tick mark
+		tickImg := ebiten.NewImage(2, g.tileSize/4)
+		tickImg.Fill(color.White)
+		tickOp := &ebiten.DrawImageOptions{}
+		tickOp.GeoM = op.GeoM
+		screen.DrawImage(tickImg, tickOp)
 	}
 
-	// Draw polygon tiles if it exists
-	if g.state.Polygon != nil {
-		polyColor := color.RGBA{128, 0, 128, 255} // Purple for polygon
+	// Draw polygon last so it's on top
+	if !g.state.Done {
+		polyColor := color.RGBA{128, 0, 128, 255}
 		for _, t := range g.state.Polygon.GetWorldTiles() {
 			x := float64(t.X * g.tileSize)
 			y := float64(t.Y * g.tileSize)
@@ -140,6 +145,21 @@ func (g *Game) Draw(screen *ebiten.Image) {
 				g.state.bestPosition.Energy/1000.0)
 		}
 		ebitenutil.DebugPrint(screen, msg)
+	}
+}
+
+func getTileColor(c Color) color.Color {
+	switch c {
+	case Red:
+		return color.RGBA{255, 0, 0, 255}
+	case Blue:
+		return color.RGBA{0, 0, 255, 255}
+	case Green:
+		return color.RGBA{0, 255, 0, 255}
+	case Yellow:
+		return color.RGBA{255, 255, 0, 255}
+	default:
+		return color.White
 	}
 }
 

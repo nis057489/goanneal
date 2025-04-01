@@ -15,6 +15,8 @@ type Tile struct {
 	X, Y        int
 	Color       Color
 	Constrained bool
+	Rotation    float64 // Rotation in degrees for displaced tiles
+	Displaced   bool    // Track if tile has been pushed
 }
 
 type Polygon struct {
@@ -38,6 +40,8 @@ func NewRectangle(width, height int, color Color) *Polygon {
 				Y:           y,
 				Color:       color,
 				Constrained: false,
+				Rotation:    0,
+				Displaced:   false,
 			}
 		}
 	}
@@ -99,6 +103,8 @@ func (p *Polygon) GetWorldTiles() []*Tile {
 						Y:           worldY,
 						Color:       p.Tiles[origY][origX].Color,
 						Constrained: false,
+						Rotation:    p.Tiles[origY][origX].Rotation,
+						Displaced:   p.Tiles[origY][origX].Displaced,
 					}
 					tiles = append(tiles, tile)
 				}
@@ -155,7 +161,54 @@ func (g *Grid) AddTile(x, y int, color Color, constrained bool) {
 		Y:           y,
 		Color:       color,
 		Constrained: constrained,
+		Rotation:    0,
+		Displaced:   false,
 	})
+}
+
+func (g *Grid) DisplaceTile(t *Tile, dx, dy int, rotation float64) bool {
+	if t.Constrained {
+		return false
+	}
+
+	// Try to find nearby empty space within 2 tile radius
+	for r := 1; r <= 2; r++ {
+		for nx := t.X - r; nx <= t.X+r; nx++ {
+			for ny := t.Y - r; ny <= t.Y+r; ny++ {
+				if nx < 0 || nx >= g.Width || ny < 0 || ny >= g.Height {
+					continue
+				}
+
+				// Check if position is empty and not overlapping with constrained tiles
+				occupied := false
+				for _, other := range g.Tiles {
+					if other.X == nx && other.Y == ny {
+						occupied = true
+						break
+					}
+				}
+
+				if !occupied {
+					t.X = nx
+					t.Y = ny
+					t.Rotation = rotation
+					t.Displaced = true
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (g *Grid) GetDisplacedTiles() []*Tile {
+	displaced := make([]*Tile, 0)
+	for _, t := range g.Tiles {
+		if t.Displaced {
+			displaced = append(displaced, t)
+		}
+	}
+	return displaced
 }
 
 func (g *Grid) GetTileAt(x, y int) *Tile {

@@ -51,35 +51,82 @@ func (s *TileState) Energy() float64 {
 		}
 	}
 
-	// Count how many movable tiles need to be displaced
-	tilesNeedingMove := 0
+	// Process tile displacement chain
+	displacementChain := make(map[*Tile]bool)
 	for _, t1 := range polyTiles {
 		for _, t2 := range s.Grid.Tiles {
 			if t1.X == t2.X && t1.Y == t2.Y {
 				if t2.Constrained {
 					return 1000000.0 // Invalid position
 				}
-				tilesNeedingMove++
-			}
-		}
-	}
 
-	// Primary objective: minimize number of tiles that need to move
-	cost = float64(tilesNeedingMove) * 1000.0
+				// Calculate rotation angle between 1-45 degrees
+				rotation := float64(1 + (len(displacementChain) % 45))
 
-	// Secondary objective: prefer positions that don't split up existing tile groups
-	for _, t1 := range s.Grid.Tiles {
-		if !t1.Constrained {
-			for _, t2 := range s.Grid.Tiles {
-				if !t2.Constrained && t1.Color == t2.Color && adjacent(t1, t2) {
-					// Add small bonus for keeping similar colored tiles together
-					cost -= 1.0
+				// Try to displace the tile
+				startX, startY := t2.X, t2.Y
+				if !s.tryDisplaceWithChain(t2, displacementChain, rotation) {
+					return 1000000.0 // Cannot displace
 				}
+
+				// Add displacement cost
+				dx := float64(t2.X - startX)
+				dy := float64(t2.Y - startY)
+				dist := dx*dx + dy*dy
+				cost += dist*100.0 + t2.Rotation*10.0
 			}
 		}
 	}
 
 	return cost
+}
+
+func (s *TileState) tryDisplaceWithChain(tile *Tile, chain map[*Tile]bool, rotation float64) bool {
+	if tile.Constrained {
+		return false
+	}
+
+	// Prevent cycles
+	if chain[tile] {
+		return false
+	}
+	chain[tile] = true
+
+	// Try displacement in spiral pattern
+	dx := []int{0, 1, 0, -1, 1, 1, -1, -1}
+	dy := []int{1, 0, -1, 0, 1, -1, 1, -1}
+
+	for i := 0; i < len(dx); i++ {
+		newX := tile.X + dx[i]
+		newY := tile.Y + dy[i]
+
+		if newX < 0 || newX >= s.Grid.Width || newY < 0 || newY >= s.Grid.Height {
+			continue
+		}
+
+		// Check if new position has a tile that needs to be displaced
+		blocked := false
+		for _, other := range s.Grid.Tiles {
+			if other.X == newX && other.Y == newY {
+				blocked = true
+				// Try to recursively displace the blocking tile
+				if s.tryDisplaceWithChain(other, chain, rotation*0.8) {
+					blocked = false
+				}
+				break
+			}
+		}
+
+		if !blocked {
+			tile.X = newX
+			tile.Y = newY
+			tile.Rotation = rotation
+			tile.Displaced = true
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *TileState) isValidPosition() bool {

@@ -16,6 +16,7 @@ import (
 type Game struct {
 	state          *TileState
 	temp           float64
+	minTemp        float64
 	coolRate       float64
 	tileSize       int
 	steps          int
@@ -38,7 +39,7 @@ func (g *Game) Update() error {
 		return nil
 	}
 
-	if g.temp > 0.1 {
+	if g.temp > g.minTemp {
 		// Do multiple moves per update
 		for i := 0; i < g.movesPerUpdate; i++ {
 			g.steps++
@@ -248,6 +249,7 @@ func main() {
 	game := &Game{
 		state:          state,
 		temp:           25.0,
+		minTemp:        22.0,
 		coolRate:       0.999, // slower cooling for visual feedback
 		tileSize:       30,
 		bestCost:       math.MaxFloat64,

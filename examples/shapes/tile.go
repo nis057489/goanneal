@@ -4,6 +4,8 @@ import "fmt"
 
 type Color int
 
+type ShapeKind int
+
 const (
 	Red Color = iota
 	Blue
@@ -11,10 +13,20 @@ const (
 	Yellow
 )
 
+const (
+	ShapeWall ShapeKind = iota
+	ShapeStar
+	ShapeSquare
+	ShapeCylinder
+	ShapeRectangle
+	ShapeIncoming
+)
+
 type Tile struct {
 	X, Y         int
 	OrigX, OrigY int // Add these fields
 	Color        Color
+	Shape        ShapeKind
 	ObjectID     int
 	Constrained  bool
 	Rotation     float64 // Rotation in degrees for displaced tiles
@@ -43,6 +55,7 @@ func NewRectangle(width, height int, color Color) *Polygon {
 				OrigX:       x, // Store original position
 				OrigY:       y,
 				Color:       color,
+				Shape:       ShapeIncoming,
 				Constrained: false,
 				Rotation:    0,
 				Displaced:   false,
@@ -189,6 +202,7 @@ func (g *Grid) AddTile(x, y int, color Color, constrained bool) {
 		OrigX:       x, // Store original position
 		OrigY:       y,
 		Color:       color,
+		Shape:       ShapeWall,
 		ObjectID:    g.allocateObjectID(),
 		Constrained: constrained,
 		Rotation:    0,
@@ -213,7 +227,7 @@ func (g *Grid) HasTileAt(x, y int) bool {
 	return false
 }
 
-func (g *Grid) AddObjectFromMask(mask [][]bool, originX, originY int, color Color, constrained bool) bool {
+func (g *Grid) AddObjectFromMask(mask [][]bool, originX, originY int, color Color, shape ShapeKind, constrained bool) bool {
 	if len(mask) == 0 || len(mask[0]) == 0 {
 		return false
 	}
@@ -248,6 +262,7 @@ func (g *Grid) AddObjectFromMask(mask [][]bool, originX, originY int, color Colo
 				OrigX:       worldX,
 				OrigY:       worldY,
 				Color:       color,
+				Shape:       shape,
 				ObjectID:    objectID,
 				Constrained: constrained,
 				Rotation:    0,

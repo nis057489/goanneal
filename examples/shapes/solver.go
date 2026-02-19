@@ -5,13 +5,24 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sort"
+	"strings"
 )
+
+const hardInvalidEnergy = 1e12
 
 // ValidPosition represents a valid polygon placement with its energy score
 type ValidPosition struct {
 	X, Y     int
 	Rotation int
 	Energy   float64
+}
+
+type polygonPoseCandidate struct {
+	x, y, rot int
+	oTiles    int
+	oObjects  int
+	energy    float64
 }
 
 // Priority Queue implementation
@@ -35,6 +46,7 @@ type TileState struct {
 	Done           bool
 	validPositions ValidPositionQueue
 	bestPosition   *ValidPosition
+	energyMemo     map[string]float64
 }
 
 func (s *TileState) Energy() float64 {
@@ -42,51 +54,109 @@ func (s *TileState) Energy() float64 {
 		return 0.0
 	}
 
+	stateKey := s.MemoKey()
+	if cached, ok := s.getMemoizedEnergy(stateKey); ok {
+		return cached
+	}
+
 	cost := 0.0
 	polyTiles := s.Polygon.GetWorldTiles()
 
-	// Check polygon bounds
+	// Check polygon bounds and constrained overlaps.
 	for _, pt := range polyTiles {
 		if pt.X < 0 || pt.X >= s.Grid.Width || pt.Y < 0 || pt.Y >= s.Grid.Height {
-			return 1000000.0
+			s.memoizeEnergy(stateKey, hardInvalidEnergy)
+			return hardInvalidEnergy
 		}
 	}
 
-	// Count tiles that need to be moved
-	displacementChain := make(map[*Tile]bool)
+	overlapTiles := 0
+	overlapObjects := make(map[int]bool)
 	for _, pt := range polyTiles {
 		for _, t := range s.Grid.Tiles {
-			if t.X == pt.X && t.Y == pt.Y {
-				if t.Constrained {
-					return 1000000.0 // Invalid position
-				}
-
-				// Base cost per displaced tile (1000)
-				cost += 1000.0
-
-				// Calculate displacement distance from original position
-				if !s.tryDisplaceWithChain(t, displacementChain, 0) {
-					// Restore all displaced tiles on failure
-					for dt := range displacementChain {
-						dt.X = dt.OrigX
-						dt.Y = dt.OrigY
-						dt.Rotation = 0
-						dt.Displaced = false
-					}
-					return 1000000.0 // Cannot displace
-				}
-
-				// Add displacement distance cost
-				dx := float64(t.X - t.OrigX)
-				dy := float64(t.Y - t.OrigY)
-				dist := math.Sqrt(dx*dx + dy*dy)
-				cost += dist * 100.0
+			if t.X != pt.X || t.Y != pt.Y {
+				continue
 			}
+			if t.Constrained {
+				s.memoizeEnergy(stateKey, hardInvalidEnergy)
+				return hardInvalidEnergy
+			}
+			overlapTiles++
+			overlapObjects[t.ObjectID] = true
 		}
 	}
 
-	// Don't reset positions - they stay displaced unless move is rejected
+	// Primary objective: clear incoming footprint completely.
+	if overlapTiles > 0 {
+		cost += float64(overlapTiles) * 50000.0
+		cost += float64(len(overlapObjects)) * 12000.0
+	}
+
+	// Secondary objective: minimal disturbance of original layout.
+	movedObjects := make(map[int]bool)
+	totalDist := 0.0
+	for _, t := range s.Grid.Tiles {
+		if t.Constrained {
+			continue
+		}
+		dx := float64(t.X - t.OrigX)
+		dy := float64(t.Y - t.OrigY)
+		dist := math.Sqrt(dx*dx + dy*dy)
+		if dist > 0 {
+			movedObjects[t.ObjectID] = true
+		}
+		totalDist += dist
+	}
+
+	distWeight := 45.0
+	objectWeight := 400.0
+	if overlapTiles > 0 {
+		distWeight = 10.0
+		objectWeight = 90.0
+	}
+
+	cost += totalDist * distWeight
+	cost += float64(len(movedObjects)) * objectWeight
+
+	s.memoizeEnergy(stateKey, cost)
 	return cost
+}
+
+func (s *TileState) getMemoizedEnergy(key string) (float64, bool) {
+	if s.energyMemo == nil {
+		return 0, false
+	}
+	v, ok := s.energyMemo[key]
+	return v, ok
+}
+
+func (s *TileState) memoizeEnergy(key string, value float64) {
+	if s.energyMemo == nil {
+		s.energyMemo = make(map[string]float64)
+	}
+	s.energyMemo[key] = value
+}
+
+func (s *TileState) MemoKey() string {
+	tiles := make([]*Tile, len(s.Grid.Tiles))
+	copy(tiles, s.Grid.Tiles)
+	sort.Slice(tiles, func(i, j int) bool {
+		if tiles[i].ObjectID != tiles[j].ObjectID {
+			return tiles[i].ObjectID < tiles[j].ObjectID
+		}
+		if tiles[i].X != tiles[j].X {
+			return tiles[i].X < tiles[j].X
+		}
+		return tiles[i].Y < tiles[j].Y
+	})
+
+	var b strings.Builder
+	b.Grow(len(tiles) * 12)
+	fmt.Fprintf(&b, "p:%d,%d,%d|", s.Polygon.PosX, s.Polygon.PosY, s.Polygon.Rotation)
+	for _, t := range tiles {
+		fmt.Fprintf(&b, "%d:%d,%d;", t.ObjectID, t.X, t.Y)
+	}
+	return b.String()
 }
 
 func (s *TileState) tryDisplaceWithChain(tile *Tile, chain map[*Tile]bool, rotation float64) bool {
@@ -217,14 +287,45 @@ func (s *TileState) Move() {
 		return
 	}
 
-	if !s.Polygon.HasValidMovesLeft(s.Grid) {
-		s.Done = true
+	overlapTiles, overlapObjects := s.overlapStats()
+
+	if overlapTiles > 0 {
+		if rand.Float64() < 0.25 {
+			if s.repositionPolygonForClearance(14) {
+				return
+			}
+		}
+		if s.clearBlockersIteratively(10) {
+			return
+		}
+		if s.aggressiveClearUnderPolygon(8) {
+			return
+		}
+		if s.pushBlockersFromPolygon(overlapObjects, 18) {
+			return
+		}
+		if s.pushNearbyObjectsFromPolygon(6, 10) {
+			return
+		}
+		if s.randomMacroObjectMove(20) {
+			return
+		}
+		if s.forcePerturb() {
+			return
+		}
+		if s.repositionPolygonForClearance(24) {
+			return
+		}
 		return
 	}
 
-	if rand.Float64() < 0.7 {
+	if rand.Float64() < 0.92 {
+		if s.pushBlockersFromPolygon(4, 10) {
+			return
+		}
+
 		// Try to move a movable object one step
-		for tries := 0; tries < 10; tries++ {
+		for tries := 0; tries < 20; tries++ {
 			idx := rand.Intn(len(s.Grid.Tiles))
 			tile := s.Grid.Tiles[idx]
 			if !tile.Constrained {
@@ -264,7 +365,7 @@ func (s *TileState) Move() {
 			}
 
 			configKey := s.Polygon.GetConfigKey()
-			if !s.Polygon.triedConfigs[configKey] && s.isValidPosition() {
+			if s.isValidPosition() {
 				s.Polygon.triedConfigs[configKey] = true
 				moved = true
 				// Store valid position and its energy
@@ -289,6 +390,587 @@ func (s *TileState) Move() {
 			s.Polygon.isDirty = true
 		}
 	}
+}
+
+func (s *TileState) repositionPolygonForClearance(randomTries int) bool {
+	curX, curY, curRot := s.Polygon.PosX, s.Polygon.PosY, s.Polygon.Rotation
+	curOverlapTiles, curOverlapObjs := s.overlapStats()
+	curEnergy := s.Energy()
+
+	best := polygonPoseCandidate{x: curX, y: curY, rot: curRot, oTiles: curOverlapTiles, oObjects: curOverlapObjs, energy: curEnergy}
+	foundBetter := false
+
+	localMoves := [][3]int{{1, 0, curRot}, {-1, 0, curRot}, {0, 1, curRot}, {0, -1, curRot}, {0, 0, (curRot + 90) % 360}}
+	for _, m := range localMoves {
+		nx := curX + m[0]
+		ny := curY + m[1]
+		nrot := m[2]
+		if !s.tryPolygonCandidate(nx, ny, nrot, &best) {
+			continue
+		}
+		foundBetter = true
+	}
+
+	for i := 0; i < randomTries; i++ {
+		nrot := (rand.Intn(4) * 90) % 360
+		w, h := s.polygonDimsAtRotation(nrot)
+		nx := rand.Intn(maxInt(1, s.Grid.Width-w+1))
+		ny := rand.Intn(maxInt(1, s.Grid.Height-h+1))
+		if !s.tryPolygonCandidate(nx, ny, nrot, &best) {
+			continue
+		}
+		foundBetter = true
+	}
+
+	if !foundBetter {
+		s.Polygon.PosX, s.Polygon.PosY, s.Polygon.Rotation = curX, curY, curRot
+		s.Polygon.isDirty = true
+		return false
+	}
+
+	improved := best.oTiles < curOverlapTiles ||
+		(best.oTiles == curOverlapTiles && best.oObjects < curOverlapObjs) ||
+		(best.oTiles == curOverlapTiles && best.oObjects == curOverlapObjs && best.energy < curEnergy)
+
+	if !improved && rand.Float64() > 0.15 {
+		s.Polygon.PosX, s.Polygon.PosY, s.Polygon.Rotation = curX, curY, curRot
+		s.Polygon.isDirty = true
+		return false
+	}
+
+	s.Polygon.PosX = best.x
+	s.Polygon.PosY = best.y
+	s.Polygon.Rotation = best.rot
+	s.Polygon.isDirty = true
+	return true
+}
+
+func (s *TileState) tryPolygonCandidate(nx, ny, nrot int, best *polygonPoseCandidate) bool {
+	oldX, oldY, oldRot := s.Polygon.PosX, s.Polygon.PosY, s.Polygon.Rotation
+	s.Polygon.PosX = nx
+	s.Polygon.PosY = ny
+	s.Polygon.Rotation = nrot
+	s.Polygon.isDirty = true
+
+	if !s.isValidPosition() {
+		s.Polygon.PosX, s.Polygon.PosY, s.Polygon.Rotation = oldX, oldY, oldRot
+		s.Polygon.isDirty = true
+		return false
+	}
+
+	oTiles, oObjs := s.overlapStats()
+	e := s.Energy()
+
+	better := oTiles < best.oTiles ||
+		(oTiles == best.oTiles && oObjs < best.oObjects) ||
+		(oTiles == best.oTiles && oObjs == best.oObjects && e < best.energy)
+
+	if better {
+		best.x, best.y, best.rot = nx, ny, nrot
+		best.oTiles, best.oObjects, best.energy = oTiles, oObjs, e
+	}
+
+	s.Polygon.PosX, s.Polygon.PosY, s.Polygon.Rotation = oldX, oldY, oldRot
+	s.Polygon.isDirty = true
+	return true
+}
+
+func (s *TileState) polygonDimsAtRotation(rot int) (int, int) {
+	w, h := s.Polygon.Width, s.Polygon.Height
+	if rot == 90 || rot == 270 {
+		w, h = h, w
+	}
+	return w, h
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (s *TileState) clearBlockersIteratively(rounds int) bool {
+	changed := false
+
+	for r := 0; r < rounds; r++ {
+		before := s.OverlapCount()
+		if before == 0 {
+			return changed
+		}
+
+		overlapCounts := s.overlappingObjectCounts()
+		type blockedObj struct {
+			id    int
+			count int
+		}
+		blockerList := make([]blockedObj, 0, len(overlapCounts))
+		for id, count := range overlapCounts {
+			blockerList = append(blockerList, blockedObj{id: id, count: count})
+		}
+		sort.Slice(blockerList, func(i, j int) bool {
+			if blockerList[i].count == blockerList[j].count {
+				return blockerList[i].id < blockerList[j].id
+			}
+			return blockerList[i].count > blockerList[j].count
+		})
+
+		roundProgress := false
+		for _, b := range blockerList {
+			if s.relocateBlockingObject(b.id, 30) {
+				roundProgress = true
+				changed = true
+				if s.OverlapCount() < before {
+					break
+				}
+			}
+		}
+
+		if s.OverlapCount() == 0 {
+			return true
+		}
+
+		if roundProgress {
+			continue
+		}
+
+		if s.pushNearbyObjectsFromPolygon(10, 14) || s.randomMacroObjectMove(24) {
+			changed = true
+			continue
+		}
+
+		break
+	}
+
+	return changed
+}
+
+func (s *TileState) relocateBlockingObject(objectID, maxSteps int) bool {
+	dirs := s.preferredExitDirections(objectID)
+	type plan struct {
+		dx, dy       int
+		steps        int
+		overlapAfter int
+	}
+
+	best := plan{steps: 0, overlapAfter: math.MaxInt32}
+	baseOverlap := s.OverlapCount()
+
+	for _, d := range dirs {
+		sim := s.Copy().(*TileState)
+		moved := 0
+		for moved < maxSteps {
+			if !sim.moveObjectIfPossible(objectID, d[0], d[1]) {
+				break
+			}
+			moved++
+			if sim.OverlapCount() < baseOverlap {
+				break
+			}
+		}
+
+		if moved == 0 {
+			continue
+		}
+
+		after := sim.OverlapCount()
+		if after < best.overlapAfter ||
+			(after == best.overlapAfter && moved < best.steps) {
+			best = plan{dx: d[0], dy: d[1], steps: moved, overlapAfter: after}
+		}
+	}
+
+	if best.steps == 0 {
+		return false
+	}
+
+	applied := 0
+	for i := 0; i < best.steps; i++ {
+		if !s.moveObjectIfPossible(objectID, best.dx, best.dy) {
+			break
+		}
+		applied++
+		if s.OverlapCount() < baseOverlap {
+			break
+		}
+	}
+
+	return applied > 0
+}
+
+func (s *TileState) preferredExitDirections(objectID int) [][2]int {
+	objectTiles := s.getObjectTiles(objectID)
+	if len(objectTiles) == 0 {
+		return [][2]int{{0, 1}, {1, 0}, {0, -1}, {-1, 0}}
+	}
+
+	var sx, sy float64
+	for _, t := range objectTiles {
+		sx += float64(t.X)
+		sy += float64(t.Y)
+	}
+	objX := sx / float64(len(objectTiles))
+	objY := sy / float64(len(objectTiles))
+
+	left := s.Polygon.PosX
+	right := s.Polygon.PosX + s.Polygon.Width - 1
+	top := s.Polygon.PosY
+	bottom := s.Polygon.PosY + s.Polygon.Height - 1
+
+	type dir struct {
+		dxy  [2]int
+		dist float64
+	}
+	dirs := []dir{
+		{dxy: [2]int{-1, 0}, dist: math.Abs(objX - float64(left))},
+		{dxy: [2]int{1, 0}, dist: math.Abs(float64(right) - objX)},
+		{dxy: [2]int{0, -1}, dist: math.Abs(objY - float64(top))},
+		{dxy: [2]int{0, 1}, dist: math.Abs(float64(bottom) - objY)},
+	}
+
+	sort.Slice(dirs, func(i, j int) bool {
+		return dirs[i].dist < dirs[j].dist
+	})
+
+	ordered := make([][2]int, 0, 4)
+	for _, d := range dirs {
+		ordered = append(ordered, d.dxy)
+	}
+	return ordered
+}
+
+func (s *TileState) forcePerturb() bool {
+	if s.randomMacroObjectMove(32) {
+		return true
+	}
+	if s.pushNearbyObjectsFromPolygon(10, 16) {
+		return true
+	}
+
+	for tries := 0; tries < 60; tries++ {
+		idx := rand.Intn(len(s.Grid.Tiles))
+		tile := s.Grid.Tiles[idx]
+		if tile.Constrained {
+			continue
+		}
+		if s.shakeObject(tile.ObjectID, 18) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *TileState) pushBlockersFromPolygon(maxObjects, maxSteps int) bool {
+	overlap := s.overlappingObjectIDs()
+	if len(overlap) == 0 {
+		return false
+	}
+
+	ids := make([]int, 0, len(overlap))
+	for id := range overlap {
+		ids = append(ids, id)
+	}
+	rand.Shuffle(len(ids), func(i, j int) {
+		ids[i], ids[j] = ids[j], ids[i]
+	})
+
+	if maxObjects > len(ids) {
+		maxObjects = len(ids)
+	}
+
+	anyMoved := false
+	for i := 0; i < maxObjects; i++ {
+		if s.pushObjectAwayFromPolygon(ids[i], maxSteps) {
+			anyMoved = true
+		}
+	}
+
+	return anyMoved
+}
+
+func (s *TileState) overlappingObjectIDs() map[int]bool {
+	overlap := make(map[int]bool)
+	for _, pt := range s.Polygon.GetWorldTiles() {
+		for _, t := range s.Grid.Tiles {
+			if t.Constrained {
+				continue
+			}
+			if t.X == pt.X && t.Y == pt.Y {
+				overlap[t.ObjectID] = true
+			}
+		}
+	}
+	return overlap
+}
+
+func (s *TileState) overlapStats() (int, int) {
+	overlapTiles := 0
+	overlapObjects := make(map[int]bool)
+	for _, pt := range s.Polygon.GetWorldTiles() {
+		for _, t := range s.Grid.Tiles {
+			if t.Constrained {
+				continue
+			}
+			if t.X == pt.X && t.Y == pt.Y {
+				overlapTiles++
+				overlapObjects[t.ObjectID] = true
+			}
+		}
+	}
+	return overlapTiles, len(overlapObjects)
+}
+
+func (s *TileState) OverlapCount() int {
+	count, _ := s.overlapStats()
+	return count
+}
+
+func (s *TileState) pushObjectAwayFromPolygon(objectID, maxSteps int) bool {
+	objectTiles := s.getObjectTiles(objectID)
+	if len(objectTiles) == 0 {
+		return false
+	}
+
+	var sumX, sumY float64
+	for _, t := range objectTiles {
+		sumX += float64(t.X)
+		sumY += float64(t.Y)
+	}
+	objX := sumX / float64(len(objectTiles))
+	objY := sumY / float64(len(objectTiles))
+
+	polyX := float64(s.Polygon.PosX) + float64(s.Polygon.Width)/2
+	polyY := float64(s.Polygon.PosY) + float64(s.Polygon.Height)/2
+
+	left := s.Polygon.PosX
+	right := s.Polygon.PosX + s.Polygon.Width - 1
+	top := s.Polygon.PosY
+	bottom := s.Polygon.PosY + s.Polygon.Height - 1
+
+	insideX := int(math.Round(objX)) >= left && int(math.Round(objX)) <= right
+	insideY := int(math.Round(objY)) >= top && int(math.Round(objY)) <= bottom
+
+	type dir struct {
+		dx, dy int
+		score  float64
+	}
+	dirs := make([]dir, 0, 4)
+	if insideX && insideY {
+		dLeft := objX - float64(left)
+		dRight := float64(right) - objX
+		dUp := objY - float64(top)
+		dDown := float64(bottom) - objY
+		dirs = append(dirs,
+			dir{dx: -1, dy: 0, score: -dLeft},
+			dir{dx: 1, dy: 0, score: -dRight},
+			dir{dx: 0, dy: -1, score: -dUp},
+			dir{dx: 0, dy: 1, score: -dDown},
+		)
+	} else {
+		vx := objX - polyX
+		vy := objY - polyY
+		dirs = append(dirs,
+			dir{dx: 0, dy: 1, score: vy},
+			dir{dx: 1, dy: 0, score: vx},
+			dir{dx: 0, dy: -1, score: -vy},
+			dir{dx: -1, dy: 0, score: -vx},
+		)
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		return dirs[i].score > dirs[j].score
+	})
+
+	moved := false
+	for _, d := range dirs {
+		steps := 0
+		for steps < maxSteps {
+			if !s.moveObjectIfPossible(objectID, d.dx, d.dy) {
+				break
+			}
+			moved = true
+			steps++
+		}
+		if moved {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *TileState) pushNearbyObjectsFromPolygon(maxObjects, maxSteps int) bool {
+	polyCenterX := float64(s.Polygon.PosX) + float64(s.Polygon.Width)/2
+	polyCenterY := float64(s.Polygon.PosY) + float64(s.Polygon.Height)/2
+
+	type candidate struct {
+		id    int
+		score float64
+	}
+
+	byObject := make(map[int][]*Tile)
+	for _, t := range s.Grid.Tiles {
+		if t.Constrained {
+			continue
+		}
+		byObject[t.ObjectID] = append(byObject[t.ObjectID], t)
+	}
+
+	candidates := make([]candidate, 0, len(byObject))
+	for id, tiles := range byObject {
+		var sx, sy float64
+		for _, t := range tiles {
+			sx += float64(t.X)
+			sy += float64(t.Y)
+		}
+		cx := sx / float64(len(tiles))
+		cy := sy / float64(len(tiles))
+		dx := cx - polyCenterX
+		dy := cy - polyCenterY
+		dist := math.Sqrt(dx*dx + dy*dy)
+		candidates = append(candidates, candidate{id: id, score: dist})
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score < candidates[j].score
+	})
+
+	if len(candidates) > maxObjects {
+		candidates = candidates[:maxObjects]
+	}
+
+	anyMoved := false
+	for _, c := range candidates {
+		if s.pushObjectAwayFromPolygon(c.id, maxSteps) {
+			anyMoved = true
+		}
+	}
+	return anyMoved
+}
+
+func (s *TileState) aggressiveClearUnderPolygon(rounds int) bool {
+	changed := false
+
+	for r := 0; r < rounds; r++ {
+		overlapCounts := s.overlappingObjectCounts()
+		if len(overlapCounts) == 0 {
+			return changed
+		}
+
+		type blocked struct {
+			id    int
+			count int
+		}
+		blockedObjects := make([]blocked, 0, len(overlapCounts))
+		for id, count := range overlapCounts {
+			blockedObjects = append(blockedObjects, blocked{id: id, count: count})
+		}
+		sort.Slice(blockedObjects, func(i, j int) bool {
+			return blockedObjects[i].count > blockedObjects[j].count
+		})
+
+		limit := 3
+		if limit > len(blockedObjects) {
+			limit = len(blockedObjects)
+		}
+
+		roundMoved := false
+		for i := 0; i < limit; i++ {
+			id := blockedObjects[i].id
+			if s.pushObjectAwayFromPolygon(id, 26) {
+				roundMoved = true
+				changed = true
+				continue
+			}
+			if s.shakeObject(id, 12) {
+				roundMoved = true
+				changed = true
+			}
+		}
+
+		if !roundMoved {
+			break
+		}
+	}
+
+	return changed
+}
+
+func (s *TileState) overlappingObjectCounts() map[int]int {
+	counts := make(map[int]int)
+	for _, pt := range s.Polygon.GetWorldTiles() {
+		for _, t := range s.Grid.Tiles {
+			if t.Constrained {
+				continue
+			}
+			if t.X == pt.X && t.Y == pt.Y {
+				counts[t.ObjectID]++
+			}
+		}
+	}
+	return counts
+}
+
+func (s *TileState) shakeObject(objectID, maxSteps int) bool {
+	if maxSteps < 2 {
+		maxSteps = 2
+	}
+
+	moves := [][2]int{{0, 1}, {1, 0}, {0, -1}, {-1, 0}}
+	rand.Shuffle(len(moves), func(i, j int) {
+		moves[i], moves[j] = moves[j], moves[i]
+	})
+
+	for _, move := range moves {
+		steps := 1 + rand.Intn(maxSteps)
+		moved := false
+		for i := 0; i < steps; i++ {
+			if !s.moveObjectIfPossible(objectID, move[0], move[1]) {
+				break
+			}
+			moved = true
+		}
+		if moved {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *TileState) randomMacroObjectMove(maxSteps int) bool {
+	if maxSteps < 2 {
+		maxSteps = 2
+	}
+
+	for tries := 0; tries < 24; tries++ {
+		idx := rand.Intn(len(s.Grid.Tiles))
+		tile := s.Grid.Tiles[idx]
+		if tile.Constrained {
+			continue
+		}
+
+		moves := [][2]int{{0, 1}, {1, 0}, {0, -1}, {-1, 0}}
+		rand.Shuffle(len(moves), func(i, j int) {
+			moves[i], moves[j] = moves[j], moves[i]
+		})
+
+		for _, move := range moves {
+			steps := 2 + rand.Intn(maxSteps-1)
+			moved := false
+			for i := 0; i < steps; i++ {
+				if !s.moveObjectIfPossible(tile.ObjectID, move[0], move[1]) {
+					break
+				}
+				moved = true
+			}
+			if moved {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func (s *TileState) RepairConstraints() {
@@ -355,6 +1037,7 @@ func (s *TileState) Copy() interface{} {
 			OrigX:       t.OrigX,
 			OrigY:       t.OrigY,
 			Color:       t.Color,
+			Shape:       t.Shape,
 			ObjectID:    t.ObjectID,
 			Constrained: t.Constrained,
 			Rotation:    t.Rotation,
@@ -388,6 +1071,7 @@ func (s *TileState) Copy() interface{} {
 				X:           t.X,
 				Y:           t.Y,
 				Color:       t.Color,
+				Shape:       t.Shape,
 				ObjectID:    t.ObjectID,
 				Constrained: t.Constrained,
 			}
@@ -399,12 +1083,18 @@ func (s *TileState) Copy() interface{} {
 	copy(newValidPositions, s.validPositions)
 	heap.Init(&newValidPositions)
 
+	newEnergyMemo := make(map[string]float64, len(s.energyMemo))
+	for k, v := range s.energyMemo {
+		newEnergyMemo[k] = v
+	}
+
 	return &TileState{
 		Grid:           newGrid,
 		Polygon:        newPoly,
 		Done:           s.Done,
 		validPositions: newValidPositions,
 		bestPosition:   s.bestPosition,
+		energyMemo:     newEnergyMemo,
 	}
 }
 
@@ -419,14 +1109,25 @@ func (s *TileState) getObjectTiles(objectID int) []*Tile {
 }
 
 func (s *TileState) moveObjectIfPossible(objectID, dx, dy int) bool {
+	return s.moveObjectWithFlow(objectID, dx, dy, make(map[int]bool))
+}
+
+func (s *TileState) moveObjectWithFlow(objectID, dx, dy int, visiting map[int]bool) bool {
 	if dx == 0 && dy == 0 {
 		return false
 	}
+	if visiting[objectID] {
+		return false
+	}
+	visiting[objectID] = true
+	defer delete(visiting, objectID)
 
 	objectTiles := s.getObjectTiles(objectID)
 	if len(objectTiles) == 0 {
 		return false
 	}
+
+	blockers := make(map[int]bool)
 
 	for _, tile := range objectTiles {
 		newX := tile.X + dx
@@ -444,6 +1145,25 @@ func (s *TileState) moveObjectIfPossible(objectID, dx, dy int) bool {
 				if other.Constrained {
 					return false
 				}
+				blockers[other.ObjectID] = true
+			}
+		}
+	}
+
+	for blockerID := range blockers {
+		if !s.moveObjectWithFlow(blockerID, dx, dy, visiting) {
+			return false
+		}
+	}
+
+	for _, tile := range objectTiles {
+		newX := tile.X + dx
+		newY := tile.Y + dy
+		for _, other := range s.Grid.Tiles {
+			if other.ObjectID == objectID {
+				continue
+			}
+			if other.X == newX && other.Y == newY {
 				return false
 			}
 		}

@@ -272,7 +272,7 @@ func main() {
 		bestCost:       math.MaxFloat64,
 		repairCounter:  0, // starts at 0. the repair func steps in every 1K iterations to ensure hard constrainst are not violated
 		bestState:      state.Copy().(*TileState),
-		movesPerUpdate: 100,
+		movesPerUpdate: 1,
 	}
 
 	ebiten.SetWindowSize(600, 600)

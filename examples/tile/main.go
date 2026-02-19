@@ -266,13 +266,13 @@ func main() {
 	game := &Game{
 		state:          state,
 		temp:           25.0,  // starting temperature
-		minTemp:        22.0,  // control how long simulation runs
+		minTemp:        1.0,  // control how long simulation runs
 		coolRate:       0.999, // very important, try different values. values closer to 1 make the sim run longer
 		tileSize:       30,
 		bestCost:       math.MaxFloat64,
 		repairCounter:  0, // starts at 0. the repair func steps in every 1K iterations to ensure hard constrainst are not violated
 		bestState:      state.Copy().(*TileState),
-		movesPerUpdate: 10,
+		movesPerUpdate: 100,
 	}
 
 	ebiten.SetWindowSize(600, 600)

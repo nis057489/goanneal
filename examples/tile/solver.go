@@ -100,6 +100,23 @@ func (s *TileState) tryDisplaceWithChain(tile *Tile, chain map[*Tile]bool, rotat
 	}
 	chain[tile] = true
 
+	// First try rotating in place
+	if rotation != 0 {
+		canRotate := true
+		// Check if rotation would cause collisions
+		for _, other := range s.Grid.Tiles {
+			if other != tile && other.X == tile.X && other.Y == tile.Y {
+				canRotate = false
+				break
+			}
+		}
+		if canRotate {
+			tile.Rotation = rotation
+			tile.Displaced = true
+			return true
+		}
+	}
+
 	// Calculate direction away from polygon center
 	polygonCenterX := float64(s.Polygon.PosX) + float64(s.Polygon.Width)/2
 	polygonCenterY := float64(s.Polygon.PosY) + float64(s.Polygon.Height)/2
@@ -110,36 +127,30 @@ func (s *TileState) tryDisplaceWithChain(tile *Tile, chain map[*Tile]bool, rotat
 	dx := tileX - polygonCenterX
 	dy := tileY - polygonCenterY
 
-	// Normalize the direction
-	length := math.Sqrt(dx*dx + dy*dy)
-	if length < 0.001 {
-		// If tile is at center, pick random direction
-		angle := rand.Float64() * 2 * math.Pi
-		dx = math.Cos(angle)
-		dy = math.Sin(angle)
-	} else {
-		dx /= length
-		dy /= length
+	// Only try adjacent positions (no diagonals)
+	moves := [][2]int{{0, 1}, {1, 0}, {0, -1}, {-1, 0}}
+
+	// Sort moves by alignment with displacement vector
+	moveScores := make([]float64, len(moves))
+	for i, move := range moves {
+		dotProduct := float64(move[0])*dx + float64(move[1])*dy
+		moveScores[i] = dotProduct
 	}
 
-	// Try positions in order of preference based on direction
-	moves := make([][2]int, 0, 8)
+	// Try moves in order of best alignment with desired direction
+	for i := 0; i < len(moves); i++ {
+		bestScore := moveScores[0]
+		bestIdx := 0
+		for j := 1; j < len(moveScores); j++ {
+			if moveScores[j] > bestScore {
+				bestScore = moveScores[j]
+				bestIdx = j
+			}
+		}
 
-	// Primary direction
-	moves = append(moves, [2]int{int(math.Round(dx)), int(math.Round(dy))})
+		move := moves[bestIdx]
+		moveScores[bestIdx] = -math.MaxFloat64 // Mark as used
 
-	// Secondary directions (perpendicular)
-	moves = append(moves, [2]int{int(math.Round(-dy)), int(math.Round(dx))})
-	moves = append(moves, [2]int{int(math.Round(dy)), int(math.Round(-dx))})
-
-	// Add diagonal and remaining directions
-	dirs := [][2]int{{1, 1}, {1, -1}, {-1, 1}, {-1, -1}, {0, 1}, {1, 0}, {0, -1}, {-1, 0}}
-	for _, d := range dirs {
-		moves = append(moves, d)
-	}
-
-	// Try each move direction
-	for _, move := range moves {
 		newX := tile.X + move[0]
 		newY := tile.Y + move[1]
 

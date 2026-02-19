@@ -1,491 +1,814 @@
 package main
 
 import (
-	"container/heap"
 	"fmt"
 	"image/color"
 	"log"
 	"math"
 	"math/rand"
-	"sort"
 	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/rudransh61/Physix-go/dynamics/collision"
+	physix "github.com/rudransh61/Physix-go/dynamics/physics"
+	"github.com/rudransh61/Physix-go/pkg/rigidbody"
+	"github.com/rudransh61/Physix-go/pkg/spring"
+	"github.com/rudransh61/Physix-go/pkg/vector"
 )
 
+const physixHardInvalidEnergy = 1e12
+
+type SceneObject struct {
+	ID       int
+	Kind     ShapeKind
+	Color    Color
+	Body     *rigidbody.RigidBody
+	Original vector.Vector
+	IsTarget bool
+	IsSoft   bool
+	Soft     *SoftBody
+}
+
+type SoftBody struct {
+	Nodes         []*rigidbody.RigidBody
+	Springs       []*spring.Spring
+	AnchorOffsets []vector.Vector
+}
+
+type SceneSnapshot struct {
+	Objects []BodySnapshot
+}
+
+type BodySnapshot struct {
+	Pos     vector.Vector
+	Vel     vector.Vector
+	NodePos []vector.Vector
+	NodeVel []vector.Vector
+}
+
+type AnnealState struct {
+	Objects  []*SceneObject
+	Target   *SceneObject
+	Walls    []*rigidbody.RigidBody
+	WidthPx  float64
+	HeightPx float64
+}
+
 type Game struct {
-	state          *TileState
+	state          *AnnealState
 	temp           float64
-	initialTemp    float64
 	minTemp        float64
 	coolRate       float64
-	tileSize       int
 	steps          int
 	accepts        int
 	improves       int
 	bestCost       float64
-	lastPrint      float64
-	repairCounter  int
-	bestState      *TileState
 	movesPerUpdate int
-	seenStates     map[string]int
+	bestSnapshot   *SceneSnapshot
+	done           bool
+	lastPrint      int
 	lastImprove    int
-	stagnationMax  int
-	archive        map[int][]*ArchivedState
-	archiveCap     int
 }
 
-type ArchivedState struct {
-	state  *TileState
-	energy float64
-	step   int
+func (s *AnnealState) Snapshot() *SceneSnapshot {
+	ss := &SceneSnapshot{Objects: make([]BodySnapshot, len(s.Objects))}
+	for i, obj := range s.Objects {
+		entry := BodySnapshot{Pos: obj.Body.Position, Vel: obj.Body.Velocity}
+		if obj.IsSoft && obj.Soft != nil {
+			entry.NodePos = make([]vector.Vector, len(obj.Soft.Nodes))
+			entry.NodeVel = make([]vector.Vector, len(obj.Soft.Nodes))
+			for j, n := range obj.Soft.Nodes {
+				entry.NodePos[j] = n.Position
+				entry.NodeVel[j] = n.Velocity
+			}
+		}
+		ss.Objects[i] = entry
+	}
+	return ss
+}
+
+func (s *AnnealState) Restore(ss *SceneSnapshot) {
+	for i, obj := range s.Objects {
+		obj.Body.Position = ss.Objects[i].Pos
+		obj.Body.Velocity = ss.Objects[i].Vel
+		if obj.IsSoft && obj.Soft != nil {
+			for j, n := range obj.Soft.Nodes {
+				n.Position = ss.Objects[i].NodePos[j]
+				n.Velocity = ss.Objects[i].NodeVel[j]
+			}
+		}
+	}
+}
+
+func (s *AnnealState) overlapCountForTarget() int {
+	overlap := 0
+	for _, obj := range s.Objects {
+		if obj.IsTarget {
+			continue
+		}
+		hit, _ := objectTargetOverlap(obj, s.Target.Body)
+		if hit {
+			overlap++
+		}
+	}
+	for _, w := range s.Walls {
+		if collides(s.Target.Body, w) {
+			overlap += 3
+		}
+	}
+	return overlap
+}
+
+func (s *AnnealState) Energy() float64 {
+	if s.overlapsWall(s.Target.Body) {
+		return physixHardInvalidEnergy
+	}
+
+	overlapPenalty := 0.0
+	overlapAreaSum := 0.0
+	overlapCount := 0.0
+	for _, obj := range s.Objects {
+		if obj.IsTarget {
+			continue
+		}
+		hit, area := objectTargetOverlap(obj, s.Target.Body)
+		if hit {
+			overlapCount += 1
+			overlapAreaSum += area
+		}
+	}
+	overlapPenalty += overlapAreaSum*180.0 + overlapCount*12000.0
+
+	distPenalty := 0.0
+	movedObjs := 0.0
+	for _, obj := range s.Objects {
+		if obj.IsTarget {
+			continue
+		}
+		d := vector.Distance(obj.Original, obj.Body.Position)
+		distPenalty += d * 120
+		if d > 1 {
+			movedObjs += 1
+		}
+	}
+
+	return overlapPenalty + distPenalty + movedObjs*220
+}
+
+func (s *AnnealState) Move(aggressive bool, freezeTarget bool) bool {
+	blockers := s.getBlockingObjects()
+	if len(blockers) > 0 && rand.Float64() < 0.82 {
+		obj := blockers[rand.Intn(len(blockers))]
+		dx, dy := awayVector(obj.Body.Position, s.Target.Body.Position)
+		bursts := 1
+		if aggressive {
+			bursts = 2 + rand.Intn(3)
+		}
+		for i := 0; i < bursts; i++ {
+			step := 12 + rand.Float64()*40
+			if aggressive {
+				step = 20 + rand.Float64()*70
+			}
+			obj.Body.Position.X += dx * step
+			obj.Body.Position.Y += dy * step
+		}
+		if aggressive {
+			s.PhysicsRelax(5)
+		} else {
+			s.PhysicsRelax(3)
+		}
+		return true
+	}
+
+	pool := s.movableObjects(freezeTarget)
+	if len(pool) == 0 {
+		return false
+	}
+	obj := pool[rand.Intn(len(pool))]
+	if !obj.Body.IsMovable {
+		return false
+	}
+
+	step := 6 + rand.Float64()*28
+	if aggressive {
+		step = 14 + rand.Float64()*60
+	}
+	ang := rand.Float64() * 2 * math.Pi
+	obj.Body.Position.X += math.Cos(ang) * step
+	obj.Body.Position.Y += math.Sin(ang) * step
+	if aggressive {
+		s.PhysicsRelax(5)
+	} else {
+		s.PhysicsRelax(3)
+	}
+	return true
+}
+
+func (s *AnnealState) movableObjects(freezeTarget bool) []*SceneObject {
+	pool := make([]*SceneObject, 0, len(s.Objects))
+	for _, obj := range s.Objects {
+		if !obj.Body.IsMovable {
+			continue
+		}
+		if freezeTarget && obj.IsTarget {
+			continue
+		}
+		pool = append(pool, obj)
+	}
+	return pool
+}
+
+func (s *AnnealState) getBlockingObjects() []*SceneObject {
+	blockers := make([]*SceneObject, 0)
+	for _, obj := range s.Objects {
+		if obj.IsTarget {
+			continue
+		}
+		hit, _ := objectTargetOverlap(obj, s.Target.Body)
+		if hit {
+			blockers = append(blockers, obj)
+		}
+	}
+	return blockers
+}
+
+func (s *AnnealState) overlapsWall(body *rigidbody.RigidBody) bool {
+	for _, w := range s.Walls {
+		if collides(body, w) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *AnnealState) PhysicsRelax(substeps int) {
+	for i := 0; i < substeps; i++ {
+		for _, obj := range s.Objects {
+			if obj.IsSoft && obj.Soft != nil {
+				for _, sp := range obj.Soft.Springs {
+					sp.ApplyForce()
+				}
+				for idx, node := range obj.Soft.Nodes {
+					off := obj.Soft.AnchorOffsets[idx]
+					target := vector.Vector{X: obj.Body.Position.X + off.X, Y: obj.Body.Position.Y + off.Y}
+					force := target.Sub(node.Position).Scale(7).Sub(node.Velocity.Scale(2.8))
+					physix.ApplyForce(node, force, 0.03)
+				}
+			}
+		}
+
+		for a := 0; a < len(s.Objects); a++ {
+			for b := a + 1; b < len(s.Objects); b++ {
+				resolveCollision(s.Objects[a].Body, s.Objects[b].Body)
+			}
+		}
+
+		for _, obj := range s.Objects {
+			for _, wall := range s.Walls {
+				resolveCollision(obj.Body, wall)
+			}
+			if obj.IsSoft && obj.Soft != nil {
+				for _, node := range obj.Soft.Nodes {
+					for _, other := range s.Objects {
+						if other == obj {
+							continue
+						}
+						resolveCollision(node, other.Body)
+					}
+					for _, wall := range s.Walls {
+						resolveCollision(node, wall)
+					}
+				}
+			}
+		}
+	}
+}
+
+func objectTargetOverlap(obj *SceneObject, target *rigidbody.RigidBody) (bool, float64) {
+	hit := false
+	area := 0.0
+
+	if collides(target, obj.Body) {
+		hit = true
+		area += overlapAreaBodies(target, obj.Body)
+	}
+
+	if !obj.IsSoft || obj.Soft == nil {
+		return hit, area
+	}
+
+	for _, n := range obj.Soft.Nodes {
+		if collides(target, n) {
+			hit = true
+			area += overlapAreaBodies(target, n)
+		}
+	}
+
+	if target.Shape == "Rectangle" {
+		for _, sp := range obj.Soft.Springs {
+			if lineIntersectsRect(sp.BallA.Position, sp.BallB.Position, target) {
+				hit = true
+				area += 380.0
+			}
+		}
+	}
+
+	return hit, area
+}
+
+func lineIntersectsRect(a, b vector.Vector, r *rigidbody.RigidBody) bool {
+	if r.Shape != "Rectangle" {
+		return false
+	}
+	rx1, ry1 := r.Position.X, r.Position.Y
+	rx2, ry2 := r.Position.X+r.Width, r.Position.Y+r.Height
+
+	if pointInRect(a, rx1, ry1, rx2, ry2) || pointInRect(b, rx1, ry1, rx2, ry2) {
+		return true
+	}
+
+	edges := [][2]vector.Vector{
+		{{X: rx1, Y: ry1}, {X: rx2, Y: ry1}},
+		{{X: rx2, Y: ry1}, {X: rx2, Y: ry2}},
+		{{X: rx2, Y: ry2}, {X: rx1, Y: ry2}},
+		{{X: rx1, Y: ry2}, {X: rx1, Y: ry1}},
+	}
+
+	for _, e := range edges {
+		if segmentsIntersect(a, b, e[0], e[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func pointInRect(p vector.Vector, x1, y1, x2, y2 float64) bool {
+	return p.X >= x1 && p.X <= x2 && p.Y >= y1 && p.Y <= y2
+}
+
+func segmentsIntersect(p1, p2, q1, q2 vector.Vector) bool {
+	orient := func(a, b, c vector.Vector) float64 {
+		return (b.Y-a.Y)*(c.X-b.X) - (b.X-a.X)*(c.Y-b.Y)
+	}
+	onSegment := func(a, b, c vector.Vector) bool {
+		return b.X <= math.Max(a.X, c.X) && b.X >= math.Min(a.X, c.X) &&
+			b.Y <= math.Max(a.Y, c.Y) && b.Y >= math.Min(a.Y, c.Y)
+	}
+
+	o1 := orient(p1, p2, q1)
+	o2 := orient(p1, p2, q2)
+	o3 := orient(q1, q2, p1)
+	o4 := orient(q1, q2, p2)
+
+	if o1*o2 < 0 && o3*o4 < 0 {
+		return true
+	}
+
+	if math.Abs(o1) < 1e-9 && onSegment(p1, q1, p2) {
+		return true
+	}
+	if math.Abs(o2) < 1e-9 && onSegment(p1, q2, p2) {
+		return true
+	}
+	if math.Abs(o3) < 1e-9 && onSegment(q1, p1, q2) {
+		return true
+	}
+	if math.Abs(o4) < 1e-9 && onSegment(q1, p2, q2) {
+		return true
+	}
+
+	return false
 }
 
 func (g *Game) Update() error {
-	if g.state.Done {
-		if g.steps > 0 {
-			// Print results once
-			g.state.PrintBestPositions(3)
-			g.steps = 0
-		}
+	if g.done {
 		return nil
 	}
 
-	if g.temp > g.minTemp {
-		// Do multiple moves per update
-		for i := 0; i < g.movesPerUpdate; i++ {
-			g.steps++
-			g.repairCounter++
-			currentEnergy := g.state.Energy()
-			currentOverlap := g.state.OverlapCount()
+	for i := 0; i < g.movesPerUpdate; i++ {
+		g.steps++
+		prevEnergy := g.state.Energy()
+		prevOverlap := g.state.overlapCountForTarget()
+		baseSnap := g.state.Snapshot()
 
-			if g.steps == 1 {
-				g.bestCost = currentEnergy
-				g.bestState = g.state.Copy().(*TileState)
-				fmt.Printf("\nStep\tTemp\t\tEnergy\t\tAccepts\tImproves\tBest\n")
-			}
+		aggressive := prevOverlap > 0 || (g.steps-g.lastImprove > 1500)
+		proposalCount := 1
+		if aggressive {
+			proposalCount = 5
+		}
 
-			// Only check repairs every 10000 steps
-			if g.repairCounter >= 10000 {
-				g.repairCounter = 0
-				g.state.RepairConstraints()
+		accepted := false
+		bestSnap := baseSnap
+		bestEnergy := prevEnergy
+		bestOverlap := prevOverlap
+
+		for p := 0; p < proposalCount; p++ {
+			g.state.Restore(baseSnap)
+			freezeTarget := prevOverlap > 0
+			if !g.state.Move(aggressive, freezeTarget) {
 				continue
 			}
 
-			// Snapshot state for rollback
-			prevState := g.state.Copy().(*TileState)
-			prevStateKey := g.state.MemoKey()
-			prevEnergy := currentEnergy
+			settleSteps := 2
+			if aggressive {
+				settleSteps += 4
+			}
+			if prevOverlap > 0 {
+				settleSteps += 4
+			}
+			g.state.PhysicsRelax(settleSteps)
 
-			// Regular annealing move
-			g.state.Move()
-			newStateKey := g.state.MemoKey()
-			if newStateKey == prevStateKey {
-				if g.state.forcePerturb() {
-					newStateKey = g.state.MemoKey()
-				}
-			}
-			if newStateKey == prevStateKey {
-				g.state = prevState
-				continue
-			}
-			maxVisits := g.maxVisitsForTemp()
-			newOverlap := g.state.OverlapCount()
-			if newOverlap > 0 {
-				maxVisits = 1_000_000
-			}
-			if g.seenStates[newStateKey] >= maxVisits {
-				g.state = prevState
-				continue
-			}
 			newEnergy := g.state.Energy()
+			newOverlap := g.state.overlapCountForTarget()
 			delta := newEnergy - prevEnergy
 
-			shouldReject := false
-			if newEnergy >= hardInvalidEnergy {
-				shouldReject = true
-			} else if newOverlap < currentOverlap {
-				shouldReject = false
-			} else if delta > 0 && math.Exp(-delta/g.temp) < rand.Float64() {
-				shouldReject = true
+			effectiveTemp := g.temp
+			if aggressive {
+				effectiveTemp = g.temp * 2.4
 			}
 
-			if shouldReject {
-				g.state = prevState
+			accept := false
+			if newEnergy >= physixHardInvalidEnergy {
+				accept = false
+			} else if newOverlap < prevOverlap {
+				accept = true
+			} else if delta <= 0 {
+				accept = true
 			} else {
-				g.seenStates[newStateKey]++
-				g.accepts++
-				if g.accepts%40 == 0 {
-					g.storeArchiveState(newEnergy)
-				}
-				if newEnergy < g.bestCost {
-					g.improves++
-					g.bestCost = newEnergy
-					g.bestState = g.state.Copy().(*TileState)
-					g.lastImprove = g.steps
-					g.storeArchiveState(newEnergy)
-				}
+				accept = math.Exp(-delta/effectiveTemp) > rand.Float64()
 			}
 
-			if g.steps-g.lastImprove > g.stagnationMax {
-				if g.state.OverlapCount() == 0 {
-					if g.jumpFromArchive() {
-						g.lastImprove = g.steps
-						g.temp = math.Min(g.initialTemp, g.temp*1.06)
-					} else {
-						g.lastImprove = g.steps
-					}
-				} else {
-					g.temp = math.Min(g.initialTemp, g.temp*1.03)
-					g.lastImprove = g.steps
-				}
+			if !accept {
+				continue
+			}
+
+			accepted = true
+			if newOverlap < bestOverlap || (newOverlap == bestOverlap && newEnergy < bestEnergy) {
+				bestEnergy = newEnergy
+				bestOverlap = newOverlap
+				bestSnap = g.state.Snapshot()
 			}
 		}
 
-		// Print progress only once per visual update
-		if float64(g.steps)-g.lastPrint >= 100 {
-			fmt.Printf("%d\t%.6f\t%.2f\t\t%.2f%%\t%.2f%%\t%.2f\n",
-				g.steps,
-				g.temp,
-				g.state.Energy(),
-				100.0*float64(g.accepts)/float64(g.steps),
-				100.0*float64(g.improves)/float64(g.steps),
-				g.bestCost)
-			g.lastPrint = float64(g.steps)
+		if !accepted {
+			g.state.Restore(baseSnap)
+			continue
 		}
 
-		g.temp *= g.coolRate
-	} else {
-		g.state.Done = true
+		g.state.Restore(bestSnap)
+		g.accepts++
+		if bestEnergy < g.bestCost {
+			g.improves++
+			g.bestCost = bestEnergy
+			g.bestSnapshot = g.state.Snapshot()
+			g.lastImprove = g.steps
+		}
 	}
+
+	if g.steps-g.lastPrint >= 100 {
+		overlap := g.state.overlapCountForTarget()
+		fmt.Printf("%d\t%.4f\t%.2f\t%.2f%%\t%.2f%%\t%d\n",
+			g.steps,
+			g.temp,
+			g.state.Energy(),
+			100*float64(g.accepts)/math.Max(1, float64(g.steps)),
+			100*float64(g.improves)/math.Max(1, float64(g.steps)),
+			overlap,
+		)
+		g.lastPrint = g.steps
+	}
+
+	g.temp *= g.coolRate
+	if g.temp <= g.minTemp {
+		g.done = true
+		if g.bestSnapshot != nil {
+			g.state.Restore(g.bestSnapshot)
+		}
+	}
+
 	return nil
-}
-
-func (g *Game) maxVisitsForTemp() int {
-	ratio := g.temp / g.initialTemp
-	switch {
-	case ratio > 0.7:
-		return 24
-	case ratio > 0.4:
-		return 16
-	case ratio > 0.2:
-		return 10
-	default:
-		return 6
-	}
-}
-
-func (g *Game) tempLevel() int {
-	ratio := g.temp / g.initialTemp
-	switch {
-	case ratio > 0.7:
-		return 0
-	case ratio > 0.4:
-		return 1
-	case ratio > 0.2:
-		return 2
-	default:
-		return 3
-	}
-}
-
-func (g *Game) storeArchiveState(energy float64) {
-	if g.archive == nil {
-		g.archive = make(map[int][]*ArchivedState)
-	}
-
-	level := g.tempLevel()
-	entry := &ArchivedState{
-		state:  g.state.Copy().(*TileState),
-		energy: energy,
-		step:   g.steps,
-	}
-
-	g.archive[level] = append(g.archive[level], entry)
-	sort.Slice(g.archive[level], func(i, j int) bool {
-		if g.archive[level][i].energy == g.archive[level][j].energy {
-			return g.archive[level][i].step > g.archive[level][j].step
-		}
-		return g.archive[level][i].energy < g.archive[level][j].energy
-	})
-
-	if len(g.archive[level]) > g.archiveCap {
-		g.archive[level] = g.archive[level][:g.archiveCap]
-	}
-}
-
-func (g *Game) jumpFromArchive() bool {
-	levelOrder := []int{g.tempLevel(), g.tempLevel() - 1, g.tempLevel() + 1, 0, 1, 2, 3}
-	for _, level := range levelOrder {
-		if level < 0 || level > 3 {
-			continue
-		}
-		entries := g.archive[level]
-		if len(entries) == 0 {
-			continue
-		}
-		pickTop := len(entries)
-		if pickTop > 5 {
-			pickTop = 5
-		}
-		choice := entries[rand.Intn(pickTop)]
-		g.state = choice.state.Copy().(*TileState)
-		g.seenStates[g.state.MemoKey()]++
-		return true
-	}
-	return false
 }
 
 func (g *Game) Draw(screen *ebiten.Image) {
 	drawerFill := color.RGBA{38, 28, 20, 255}
 	drawerBorder := color.RGBA{170, 120, 75, 255}
-	ebitenutil.DrawRect(screen, 0, 0, float64(g.state.Grid.Width*g.tileSize), float64(g.state.Grid.Height*g.tileSize), drawerFill)
-	ebitenutil.DrawRect(screen, 0, 0, float64(g.state.Grid.Width*g.tileSize), 4, drawerBorder)
-	ebitenutil.DrawRect(screen, 0, float64(g.state.Grid.Height*g.tileSize-4), float64(g.state.Grid.Width*g.tileSize), 4, drawerBorder)
-	ebitenutil.DrawRect(screen, 0, 0, 4, float64(g.state.Grid.Height*g.tileSize), drawerBorder)
-	ebitenutil.DrawRect(screen, float64(g.state.Grid.Width*g.tileSize-4), 0, 4, float64(g.state.Grid.Height*g.tileSize), drawerBorder)
+	ebitenutil.DrawRect(screen, 0, 0, g.state.WidthPx, g.state.HeightPx, drawerFill)
+	for _, w := range g.state.Walls {
+		ebitenutil.DrawRect(screen, w.Position.X, w.Position.Y, w.Width, w.Height, drawerBorder)
+	}
 
-	for _, objectTiles := range groupObjects(g.state.Grid.Tiles) {
-		rep := objectTiles[0]
-		if rep.Constrained {
+	for _, obj := range g.state.Objects {
+		if obj.IsTarget {
 			continue
 		}
-
-		minX, minY, maxX, maxY := objectBounds(objectTiles)
-		x := float64(minX * g.tileSize)
-		y := float64(minY * g.tileSize)
-		w := float64((maxX-minX+1)*g.tileSize)
-		h := float64((maxY-minY+1)*g.tileSize)
-
-		drawClutterShape(screen, rep.Shape, x, y, w, h, getTileColor(rep.Color), rep.Displaced)
+		drawObject(screen, obj, false)
 	}
+	drawObject(screen, g.state.Target, true)
 
-	if !g.state.Done {
-		px := float64(g.state.Polygon.PosX * g.tileSize)
-		py := float64(g.state.Polygon.PosY * g.tileSize)
-		pw := float64(g.state.Polygon.Width * g.tileSize)
-		ph := float64(g.state.Polygon.Height * g.tileSize)
-		drawIncomingObject(screen, px, py, pw, ph)
-	}
-
-	// Draw debug text
-	if g.state.Done {
-		msg := "No valid positions found!"
-		if g.state.bestPosition != nil {
-			msg = fmt.Sprintf("Best position found! Objects to move score: %.0f",
-				g.state.bestPosition.Energy/1000.0)
-		}
-		ebitenutil.DebugPrint(screen, msg)
-	}
+	ebitenutil.DebugPrint(screen, fmt.Sprintf("Energy: %.1f  Overlap: %d", g.state.Energy(), g.state.overlapCountForTarget()))
 }
 
-func getTileColor(c Color) color.Color {
-	switch c {
-	case Red:
-		return color.RGBA{255, 0, 0, 255}
-	case Blue:
-		return color.RGBA{0, 0, 255, 255}
-	case Green:
-		return color.RGBA{0, 255, 0, 255}
-	case Yellow:
-		return color.RGBA{255, 255, 0, 255}
+func drawObject(screen *ebiten.Image, obj *SceneObject, target bool) {
+	if obj.Body.Shape == "Circle" {
+		ebitenutil.DrawCircle(screen, obj.Body.Position.X, obj.Body.Position.Y, obj.Body.Radius, sceneColor(obj.Color, target))
+		return
+	}
+
+	x := obj.Body.Position.X
+	y := obj.Body.Position.Y
+	w := obj.Body.Width
+	h := obj.Body.Height
+
+	switch obj.Kind {
+	case ShapeStar:
+		drawStar(screen, x, y, w, h, sceneColor(obj.Color, target))
+	case ShapeCylinder:
+		drawCylinder(screen, x, y, w, h, sceneColor(obj.Color, target))
 	default:
-		return color.White
+		ebitenutil.DrawRect(screen, x, y, w, h, sceneColor(obj.Color, target))
 	}
 }
 
 func (g *Game) Layout(w, h int) (int, int) {
-	return g.state.Grid.Width * g.tileSize, g.state.Grid.Height * g.tileSize
+	return int(g.state.WidthPx), int(g.state.HeightPx)
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
-	grid := NewGrid(20, 20)
-
-	// Drawer walls (constrained)
-	for x := 0; x < grid.Width; x++ {
-		grid.AddTile(x, 0, Red, true)
-		grid.AddTile(x, grid.Height-1, Red, true)
-	}
-	for y := 1; y < grid.Height-1; y++ {
-		grid.AddTile(0, y, Red, true)
-		grid.AddTile(grid.Width-1, y, Red, true)
-	}
-
-	// Cluttered drawer objects: stars, squares, cylinders, rectangles
-	shapeDefs := []struct {
-		name  string
-		mask  [][]bool
-		color Color
-		kind  ShapeKind
-		count int
-	}{
-		{name: "star", mask: starMask(), color: Yellow, kind: ShapeStar, count: 4},
-		{name: "square", mask: squareMask(3), color: Blue, kind: ShapeSquare, count: 4},
-		{name: "cylinder", mask: cylinderMask(), color: Green, kind: ShapeCylinder, count: 3},
-		{name: "rectangle", mask: rectangleMask(5, 2), color: Blue, kind: ShapeRectangle, count: 4},
-	}
-
-	for _, def := range shapeDefs {
-		for i := 0; i < def.count; i++ {
-			placed := false
-			for tries := 0; tries < 1400; tries++ {
-				maskW, maskH := maskDimensions(def.mask)
-				x := 1 + rand.Intn(grid.Width-maskW-2)
-				y := 1 + rand.Intn(grid.Height-maskH-2)
-				if grid.AddObjectFromMask(def.mask, x, y, def.color, def.kind, false) {
-					placed = true
-					break
-				}
-			}
-			if !placed {
-				fmt.Printf("warning: could not place %s object %d\n", def.name, i+1)
-			}
-		}
-	}
-
-	movableCells := 0
-	for _, t := range grid.Tiles {
-		if !t.Constrained {
-			movableCells++
-		}
-	}
-	maxMovableForGuaranteed9x9 := (grid.Width-2)*(grid.Height-2) - (9 * 9)
-	if movableCells > maxMovableForGuaranteed9x9 {
-		fmt.Printf("warning: clutter density is high (%d cells), fitting 9x9 may require major rearrangement\n", movableCells)
-	}
-
-	// New object we want to place in the cluttered drawer
-	polygon := NewRectangle(9, 9, Blue)
-	polygon.PosX = 1
-	polygon.PosY = 1
-
-	state := &TileState{
-		Grid:           grid,
-		Polygon:        polygon,
-		validPositions: make(ValidPositionQueue, 0),
-	}
-	heap.Init(&state.validPositions)
-
-	// Validate initial position for incoming 9x9 object
-	if !state.isValidPosition() {
-		found := false
-		for x := 1; x < grid.Width-polygon.Width-1; x++ {
-			for y := 1; y < grid.Height-polygon.Height-1; y++ {
-				polygon.PosX = x
-				polygon.PosY = y
-				if state.isValidPosition() {
-					found = true
-					break
-				}
-			}
-			if found {
-				break
-			}
-		}
-		if !found {
-			log.Fatal("Could not find valid starting position for 9x9 object")
-		}
-	}
-
+	scene := buildScene(600, 600)
 	game := &Game{
-		state:          state,
-		temp:           120.0,
-		initialTemp:    120.0,
-		minTemp:        0.8,
-		coolRate:       0.9992,
-		tileSize:       30,
-		bestCost:       math.MaxFloat64,
-		repairCounter:  0,
-		bestState:      state.Copy().(*TileState),
-		movesPerUpdate: 140,
-		seenStates:     map[string]int{state.MemoKey(): 1},
+		state:          scene,
+		temp:           82,
+		minTemp:        0.6,
+		coolRate:       0.99935,
+		movesPerUpdate: 180,
+		bestCost:       scene.Energy(),
+		bestSnapshot:   scene.Snapshot(),
 		lastImprove:    0,
-		stagnationMax:  1800,
-		archive:        make(map[int][]*ArchivedState),
-		archiveCap:     20,
 	}
-	game.storeArchiveState(game.state.Energy())
 
-	ebiten.SetWindowSize(600, 600)
-	ebiten.SetWindowTitle("Cluttered Drawer Annealing")
+	fmt.Printf("\nStep\tTemp\tEnergy\tAccepts\tImproves\tOverlap\n")
 
+	ebiten.SetWindowSize(int(scene.WidthPx), int(scene.HeightPx))
+	ebiten.SetWindowTitle("Physix Drawer Annealing")
 	if err := ebiten.RunGame(game); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func groupObjects(tiles []*Tile) [][]*Tile {
-	byObject := make(map[int][]*Tile)
-	for _, tile := range tiles {
-		byObject[tile.ObjectID] = append(byObject[tile.ObjectID], tile)
+func buildScene(width, height float64) *AnnealState {
+	walls := []*rigidbody.RigidBody{
+		{Position: vector.Vector{X: 0, Y: 0}, Shape: "Rectangle", Width: width, Height: 8, IsMovable: false, Mass: rigidbody.Infinite_mass},
+		{Position: vector.Vector{X: 0, Y: height - 8}, Shape: "Rectangle", Width: width, Height: 8, IsMovable: false, Mass: rigidbody.Infinite_mass},
+		{Position: vector.Vector{X: 0, Y: 0}, Shape: "Rectangle", Width: 8, Height: height, IsMovable: false, Mass: rigidbody.Infinite_mass},
+		{Position: vector.Vector{X: width - 8, Y: 0}, Shape: "Rectangle", Width: 8, Height: height, IsMovable: false, Mass: rigidbody.Infinite_mass},
 	}
 
-	ids := make([]int, 0, len(byObject))
-	for id := range byObject {
-		ids = append(ids, id)
-	}
-	sort.Ints(ids)
+	objects := make([]*SceneObject, 0)
+	nextID := 1
 
-	groups := make([][]*Tile, 0, len(ids))
-	for _, id := range ids {
-		groups = append(groups, byObject[id])
+	spawnRect := func(kind ShapeKind, c Color, w, h float64, soft bool, count int) {
+		for i := 0; i < count; i++ {
+			placed := false
+			for tries := 0; tries < 1200; tries++ {
+				x := 12 + rand.Float64()*(width-w-24)
+				y := 12 + rand.Float64()*(height-h-24)
+				body := &rigidbody.RigidBody{Position: vector.Vector{X: x, Y: y}, Velocity: vector.Vector{X: 0, Y: 0}, Mass: 50, Shape: "Rectangle", Width: w, Height: h, IsMovable: true}
+				if collidesAny(body, objects, walls) {
+					continue
+				}
+				obj := &SceneObject{ID: nextID, Kind: kind, Color: c, Body: body, Original: body.Position, IsSoft: soft}
+				nextID++
+				if soft {
+					obj.Soft = makeSoftBody(body)
+				}
+				objects = append(objects, obj)
+				placed = true
+				break
+			}
+			if !placed {
+				fmt.Printf("warning: could not place %v object %d\n", kind, i+1)
+			}
+		}
 	}
-	return groups
+
+	spawnCircle := func(kind ShapeKind, c Color, r float64, soft bool, count int) {
+		for i := 0; i < count; i++ {
+			placed := false
+			for tries := 0; tries < 1200; tries++ {
+				x := 12 + r + rand.Float64()*(width-2*r-24)
+				y := 12 + r + rand.Float64()*(height-2*r-24)
+				body := &rigidbody.RigidBody{Position: vector.Vector{X: x, Y: y}, Velocity: vector.Vector{X: 0, Y: 0}, Mass: 50, Shape: "Circle", Radius: r, IsMovable: true}
+				if collidesAny(body, objects, walls) {
+					continue
+				}
+				obj := &SceneObject{ID: nextID, Kind: kind, Color: c, Body: body, Original: body.Position, IsSoft: soft}
+				nextID++
+				if soft {
+					obj.Soft = makeSoftBody(body)
+				}
+				objects = append(objects, obj)
+				placed = true
+				break
+			}
+			if !placed {
+				fmt.Printf("warning: could not place %v object %d\n", kind, i+1)
+			}
+		}
+	}
+
+	spawnRect(ShapeStar, Yellow, 95, 95, true, 3)
+	spawnRect(ShapeSquare, Blue, 90, 90, false, 4)
+	spawnCircle(ShapeCylinder, Green, 42, true, 3)
+	spawnRect(ShapeRectangle, Blue, 140, 60, false, 4)
+
+	target := &SceneObject{
+		ID:       nextID,
+		Kind:     ShapeIncoming,
+		Color:    Blue,
+		Body:     &rigidbody.RigidBody{Position: vector.Vector{X: 160, Y: 160}, Velocity: vector.Vector{X: 0, Y: 0}, Mass: 80, Shape: "Rectangle", Width: 270, Height: 270, IsMovable: true},
+		Original: vector.Vector{X: 160, Y: 160},
+		IsTarget: true,
+	}
+	objects = append(objects, target)
+
+	return &AnnealState{Objects: objects, Target: target, Walls: walls, WidthPx: width, HeightPx: height}
 }
 
-func objectBounds(tiles []*Tile) (int, int, int, int) {
-	minX, minY := tiles[0].X, tiles[0].Y
-	maxX, maxY := tiles[0].X, tiles[0].Y
-	for _, tile := range tiles[1:] {
-		if tile.X < minX {
-			minX = tile.X
-		}
-		if tile.Y < minY {
-			minY = tile.Y
-		}
-		if tile.X > maxX {
-			maxX = tile.X
-		}
-		if tile.Y > maxY {
-			maxY = tile.Y
+func collidesAny(body *rigidbody.RigidBody, objs []*SceneObject, walls []*rigidbody.RigidBody) bool {
+	for _, o := range objs {
+		if collides(body, o.Body) {
+			return true
 		}
 	}
-	return minX, minY, maxX, maxY
+	for _, w := range walls {
+		if collides(body, w) {
+			return true
+		}
+	}
+	return false
 }
 
-func drawClutterShape(screen *ebiten.Image, kind ShapeKind, x, y, w, h float64, c color.Color, displaced bool) {
-	base := c
-	if displaced {
-		base = color.RGBA{255, 220, 120, 255}
+func resolveCollision(a, b *rigidbody.RigidBody) {
+	if !collides(a, b) {
+		return
 	}
 
-	pad := 3.0
-	sx, sy := x+pad, y+pad
-	sw, sh := w-2*pad, h-2*pad
-
-	switch kind {
-	case ShapeStar:
-		drawStar(screen, sx, sy, sw, sh, base)
-	case ShapeCylinder:
-		drawCylinder(screen, sx, sy, sw, sh, base)
-	case ShapeRectangle:
-		ebitenutil.DrawRect(screen, sx, sy+sh*0.2, sw, sh*0.6, base)
-		ebitenutil.DrawLine(screen, sx, sy+sh*0.2, sx+sw, sy+sh*0.2, color.Black)
-		ebitenutil.DrawLine(screen, sx, sy+sh*0.8, sx+sw, sy+sh*0.8, color.Black)
+	switch {
+	case a.Shape == "Circle" && b.Shape == "Circle":
+		collision.PreventCircleOverlap(a, b)
+		collision.BounceOnCollision(a, b, 0.25)
+	case a.Shape == "Circle" && b.Shape == "Rectangle":
+		collision.PreventCircleRectangleOverlap(a, b)
+		collision.BounceOnCollision(a, b, 0.2)
+	case a.Shape == "Rectangle" && b.Shape == "Circle":
+		collision.PreventCircleRectangleOverlap(b, a)
+		collision.BounceOnCollision(a, b, 0.2)
 	default:
-		ebitenutil.DrawRect(screen, sx, sy, sw, sh, base)
+		collision.PreventRectangleOverlap(a, b)
+		collision.BounceOnCollision(a, b, 0.15)
 	}
 }
 
-func drawIncomingObject(screen *ebiten.Image, x, y, w, h float64) {
-	ebitenutil.DrawRect(screen, x+2, y+2, w-4, h-4, color.RGBA{170, 90, 210, 120})
-	ebitenutil.DrawLine(screen, x+2, y+2, x+w-2, y+2, color.RGBA{235, 180, 255, 255})
-	ebitenutil.DrawLine(screen, x+w-2, y+2, x+w-2, y+h-2, color.RGBA{235, 180, 255, 255})
-	ebitenutil.DrawLine(screen, x+w-2, y+h-2, x+2, y+h-2, color.RGBA{235, 180, 255, 255})
-	ebitenutil.DrawLine(screen, x+2, y+h-2, x+2, y+2, color.RGBA{235, 180, 255, 255})
+func collides(a, b *rigidbody.RigidBody) bool {
+	switch {
+	case a.Shape == "Circle" && b.Shape == "Circle":
+		return collision.CircleCollided(a, b)
+	case a.Shape == "Circle" && b.Shape == "Rectangle":
+		return collision.CircleRectangleCollided(a, b)
+	case a.Shape == "Rectangle" && b.Shape == "Circle":
+		return collision.CircleRectangleCollided(b, a)
+	default:
+		return collision.RectangleCollided(a, b)
+	}
+}
+
+func overlapAreaBodies(a, b *rigidbody.RigidBody) float64 {
+	switch {
+	case a.Shape == "Rectangle" && b.Shape == "Rectangle":
+		return overlapAreaRectRect(a, b)
+	case a.Shape == "Circle" && b.Shape == "Circle":
+		return overlapAreaCircleCircle(a, b)
+	case a.Shape == "Circle" && b.Shape == "Rectangle":
+		return overlapAreaCircleRect(a, b)
+	case a.Shape == "Rectangle" && b.Shape == "Circle":
+		return overlapAreaCircleRect(b, a)
+	default:
+		return 0
+	}
+}
+
+func overlapAreaRectRect(a, b *rigidbody.RigidBody) float64 {
+	ax1, ay1 := a.Position.X, a.Position.Y
+	ax2, ay2 := a.Position.X+a.Width, a.Position.Y+a.Height
+	bx1, by1 := b.Position.X, b.Position.Y
+	bx2, by2 := b.Position.X+b.Width, b.Position.Y+b.Height
+
+	ox := math.Max(0, math.Min(ax2, bx2)-math.Max(ax1, bx1))
+	oy := math.Max(0, math.Min(ay2, by2)-math.Max(ay1, by1))
+	return ox * oy
+}
+
+func overlapAreaCircleCircle(a, b *rigidbody.RigidBody) float64 {
+	d := vector.Distance(a.Position, b.Position)
+	overlap := (a.Radius + b.Radius) - d
+	if overlap <= 0 {
+		return 0
+	}
+	return math.Pi * overlap * overlap
+}
+
+func overlapAreaCircleRect(circle, rect *rigidbody.RigidBody) float64 {
+	cx, cy := circle.Position.X, circle.Position.Y
+	rx1, ry1 := rect.Position.X, rect.Position.Y
+	rx2, ry2 := rect.Position.X+rect.Width, rect.Position.Y+rect.Height
+
+	closestX := clamp(cx, rx1, rx2)
+	closestY := clamp(cy, ry1, ry2)
+	dx := cx - closestX
+	dy := cy - closestY
+	dist := math.Hypot(dx, dy)
+	penetration := circle.Radius - dist
+	if penetration <= 0 {
+		return 0
+	}
+	return math.Pi * penetration * penetration
+}
+
+func clamp(v, low, high float64) float64 {
+	if v < low {
+		return low
+	}
+	if v > high {
+		return high
+	}
+	return v
+}
+
+func makeSoftBody(anchor *rigidbody.RigidBody) *SoftBody {
+	cx, cy := anchor.Position.X, anchor.Position.Y
+	if anchor.Shape == "Rectangle" {
+		cx += anchor.Width / 2
+		cy += anchor.Height / 2
+	}
+	rx := 42.0
+	ry := 42.0
+	if anchor.Shape == "Rectangle" {
+		rx = anchor.Width * 0.36
+		ry = anchor.Height * 0.36
+	}
+
+	offsets := []vector.Vector{{X: -rx, Y: -ry}, {X: rx, Y: -ry}, {X: rx, Y: ry}, {X: -rx, Y: ry}, {X: 0, Y: 0}}
+	nodes := make([]*rigidbody.RigidBody, len(offsets))
+	for i, off := range offsets {
+		nodes[i] = &rigidbody.RigidBody{Position: vector.Vector{X: cx + off.X, Y: cy + off.Y}, Velocity: vector.Vector{X: 0, Y: 0}, Mass: 20, Shape: "Circle", Radius: 5, IsMovable: true}
+	}
+
+	springs := []*spring.Spring{
+		spring.NewSpring(nodes[0], nodes[1], 3.0, 2.2),
+		spring.NewSpring(nodes[1], nodes[2], 3.0, 2.2),
+		spring.NewSpring(nodes[2], nodes[3], 3.0, 2.2),
+		spring.NewSpring(nodes[3], nodes[0], 3.0, 2.2),
+		spring.NewSpring(nodes[0], nodes[2], 2.8, 2.2),
+		spring.NewSpring(nodes[1], nodes[3], 2.8, 2.2),
+		spring.NewSpring(nodes[4], nodes[0], 3.2, 2.2),
+		spring.NewSpring(nodes[4], nodes[1], 3.2, 2.2),
+		spring.NewSpring(nodes[4], nodes[2], 3.2, 2.2),
+		spring.NewSpring(nodes[4], nodes[3], 3.2, 2.2),
+	}
+
+	return &SoftBody{Nodes: nodes, Springs: springs, AnchorOffsets: offsets}
+}
+
+func awayVector(a, b vector.Vector) (float64, float64) {
+	dx := a.X - b.X
+	dy := a.Y - b.Y
+	m := math.Hypot(dx, dy)
+	if m < 1e-6 {
+		a := rand.Float64() * 2 * math.Pi
+		return math.Cos(a), math.Sin(a)
+	}
+	return dx / m, dy / m
+}
+
+func sceneColor(c Color, highlight bool) color.Color {
+	if highlight {
+		return color.RGBA{170, 90, 210, 200}
+	}
+	switch c {
+	case Red:
+		return color.RGBA{255, 0, 0, 255}
+	case Blue:
+		return color.RGBA{40, 120, 255, 255}
+	case Green:
+		return color.RGBA{50, 220, 110, 255}
+	case Yellow:
+		return color.RGBA{255, 220, 40, 255}
+	default:
+		return color.White
+	}
 }
 
 func drawStar(screen *ebiten.Image, x, y, w, h float64, c color.Color) {
@@ -530,46 +853,4 @@ func drawEllipseOutline(screen *ebiten.Image, cx, cy, rx, ry float64, c color.Co
 		y1 := cy + math.Sin(a1)*ry
 		ebitenutil.DrawLine(screen, x0, y0, x1, y1, c)
 	}
-}
-
-func squareMask(size int) [][]bool {
-	return rectangleMask(size, size)
-}
-
-func rectangleMask(width, height int) [][]bool {
-	mask := make([][]bool, height)
-	for y := range mask {
-		mask[y] = make([]bool, width)
-		for x := range mask[y] {
-			mask[y][x] = true
-		}
-	}
-	return mask
-}
-
-func starMask() [][]bool {
-	return [][]bool{
-		{false, false, true, false, false},
-		{false, true, true, true, false},
-		{true, true, true, true, true},
-		{false, true, true, true, false},
-		{true, false, true, false, true},
-	}
-}
-
-func cylinderMask() [][]bool {
-	return [][]bool{
-		{false, true, true, true, false},
-		{true, true, true, true, true},
-		{true, true, true, true, true},
-		{true, true, true, true, true},
-		{false, true, true, true, false},
-	}
-}
-
-func maskDimensions(mask [][]bool) (int, int) {
-	if len(mask) == 0 {
-		return 0, 0
-	}
-	return len(mask[0]), len(mask)
 }

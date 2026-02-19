@@ -2,7 +2,10 @@ module tiler
 
 go 1.23.7
 
-require github.com/hajimehoshi/ebiten/v2 v2.8.7
+require (
+	github.com/hajimehoshi/ebiten/v2 v2.8.7
+	github.com/rudransh61/Physix-go v1.2.0
+)
 
 require (
 	github.com/ebitengine/gomobile v0.0.0-20240911145611-4856209ac325 // indirect
